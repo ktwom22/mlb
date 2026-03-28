@@ -1,0 +1,8 @@
+Flask
+pandas
+pulp
+requests
+pybaseball
+gunicorn
+psycopg2-binary
+SQLAlchemy
