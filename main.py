@@ -22,7 +22,6 @@ TEAM_MAP = {
     "SLN": "STL", "CHC": "CHC", "CHN": "CHC", "TOR": "TOR", "COL": "COL", "ATL": "ATL"
 }
 
-
 def clean_hand_str(h):
     if pd.isna(h): return "?"
     s = str(h).upper()
@@ -30,7 +29,6 @@ def clean_hand_str(h):
     if 'L' in s: return 'L'
     if 'S' in s: return 'S'
     return "?"
-
 
 def get_today_slate():
     url = "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard"
@@ -51,134 +49,131 @@ def get_today_slate():
     except:
         return {}
 
-
 def get_weighted_stats():
     try:
-        h26 = batting_stats(2026);
-        h25 = batting_stats(2025)
+        h26 = batting_stats(2026); h25 = batting_stats(2025)
         h_merge = pd.merge(h26, h25, on='Name', how='outer', suffixes=('_26', '_25')).fillna(0)
         h_merge['W_Barrel'] = (h_merge['Barrel%_26'] * 0.7) + (h_merge['Barrel%_25'] * 0.3)
         h_merge['W_xwOBA'] = (h_merge['xwOBA_26'] * 0.7) + (h_merge['xwOBA_25'] * 0.3)
         h_merge['W_BB'] = (h_merge['BB%_26'] * 0.7) + (h_merge['BB%_25'] * 0.3)
-        h_merge['Edge_Value'] = (h_merge['W_Barrel'] * 0.4) + (h_merge['W_xwOBA'] * 0.4) + (h_merge['W_BB'] * 0.2)
-        h_final = h_merge[['Name', 'Edge_Value', 'W_Barrel', 'W_xwOBA']].rename(
-            columns={'W_Barrel': 'Barrel%', 'W_xwOBA': 'xwOBA'})
+        h_merge['Edge_Value'] = (h_merge['W_Barrel'] * 40) + (h_merge['W_xwOBA'] * 40) + (h_merge['W_BB'] * 20)
+        h_final = h_merge[['Name', 'Edge_Value', 'W_Barrel', 'W_xwOBA']].rename(columns={'W_Barrel': 'Barrel%', 'W_xwOBA': 'xwOBA'})
 
-        p26 = pitching_stats(2026);
-        p25 = pitching_stats(2025)
+        p26 = pitching_stats(2026); p25 = pitching_stats(2025)
         p_merge = pd.merge(p26, p25, on='Name', how='outer', suffixes=('_26', '_25')).fillna(0)
         p_merge['W_SIERA'] = (p_merge['SIERA_26'] * 0.7) + (p_merge['SIERA_25'] * 0.3)
         p_merge['W_KBB'] = (p_merge['K-BB%_26'] * 0.7) + (p_merge['K-BB%_25'] * 0.3)
         p_merge['W_SwStr'] = (p_merge['SwStr%_26'] * 0.7) + (p_merge['SwStr%_25'] * 0.3)
-        p_merge['Chalk_Quality'] = (p_merge['W_KBB'] * 100) + (10 / p_merge['W_SIERA'].replace(0, 5)) + (
-                    p_merge['W_SwStr'] * 100)
-        p_final = p_merge[['Name', 'Chalk_Quality', 'W_SIERA', 'W_KBB']].rename(
-            columns={'W_SIERA': 'SIERA', 'W_KBB': 'K-BB%'})
-
+        p_merge['Chalk_Quality'] = (p_merge['W_KBB'] * 100) + (10 / p_merge['W_SIERA'].replace(0, 5)) + (p_merge['W_SwStr'] * 100)
+        p_final = p_merge[['Name', 'Chalk_Quality', 'W_SIERA', 'W_KBB']].rename(columns={'W_SIERA': 'SIERA', 'W_KBB': 'K-BB%'})
         return h_final, p_final
     except:
         return pd.DataFrame(), pd.DataFrame()
 
-
-def run_optimizer(df, num_lineups=1, locks=[], stack_team=None, min_stack=3, diversity=4, excluded_games=[]):
+def run_optimizer(df_input, num_lineups=1, locks=[], stack_team=None, min_stack=3, diversity=4, excluded_games=[]):
+    df = df_input.copy()
     all_results = []
-    past_solutions = []
+    used_player_indices = []
+
+    # 1. Filter excluded games
+    if excluded_games:
+        for gid in excluded_games:
+            teams_in_game = gid.split(" vs ")
+            df = df[~df['Team'].isin(teams_in_game)]
+
+    # 2. Rebuild Pitcher Hand Map for Platoon Adv
     pitchers_df = df[df['POS'].str.contains('P', na=False)]
     p_hand_map = pitchers_df.set_index('Team')['CleanHand'].to_dict()
-
-    def check_adv(b_clean, o_clean):
-        if b_clean == 'S': return True
-        if b_clean == 'L' and o_clean == 'R': return True
-        if b_clean == 'R' and o_clean == 'L': return True
-        return False
 
     def apply_logic(row):
         base_proj = row['Proj']
         if 'P' in str(row['POS']):
-            if 'Chalk_Quality' in row and row['Chalk_Quality'] > 0:
-                return base_proj * (1 + (row['Chalk_Quality'] / 400))
-            return base_proj
-        if 'Edge_Value' in row and row['Edge_Value'] > 0:
-            base_proj = (base_proj * 0.85) + (row['Edge_Value'] * 15 * 0.15)
-        if check_adv(row['CleanHand'], p_hand_map.get(row['Opponent'], '?')):
-            return base_proj * 1.12
+            return base_proj * (1 + (row.get('Chalk_Quality', 0) / 400)) if row.get('Chalk_Quality', 0) > 0 else base_proj
+        if row.get('Edge_Value', 0) > 0:
+            base_proj = (base_proj * 0.85) + (row['Edge_Value'] * 0.15)
+        # Platoon Adv (12%)
+        b_clean, o_clean = row['CleanHand'], p_hand_map.get(row['Opponent'], '?')
+        if b_clean == 'S' or (b_clean == 'L' and o_clean == 'R') or (b_clean == 'R' and o_clean == 'L'):
+            base_proj *= 1.12
         return base_proj
 
     df['Solver_Proj'] = df.apply(apply_logic, axis=1)
-
-    if excluded_games:
-        for gid in excluded_games:
-            teams_in_game = gid.split(" vs ")
-            df = df[~df['Team'].isin(teams_in_game)].copy()
+    teams_to_stack = [stack_team] if (stack_team and stack_team != "None") else df['Team'].unique()
 
     for i in range(num_lineups):
-        prob = pulp.LpProblem(f"MLB_{i}", pulp.LpMaximize)
-        players = df.index.tolist();
-        slots = list(POS_ORDER.keys())
-        x = pulp.LpVariable.dicts("x", (players, slots), cat="Binary")
+        best_lineup_for_pass = None
+        highest_score = -1
 
-        prob += pulp.lpSum([df.loc[p, 'Solver_Proj'] * x[p][s] for p in players for s in slots])
-        prob += pulp.lpSum([df.loc[p, 'Salary'] * x[p][s] for p in players for s in slots]) <= 50000
+        for current_team in teams_to_stack:
+            prob = pulp.LpProblem(f"MLB_Gen_{i}_{current_team}", pulp.LpMaximize)
+            players = df.index.tolist()
+            slots = list(POS_ORDER.keys())
+            x = pulp.LpVariable.dicts("x", (players, slots), cat="Binary")
 
-        for s in slots: prob += pulp.lpSum([x[p][s] for p in players]) == 1
-        for p in players: prob += pulp.lpSum([x[p][s] for s in slots]) <= 1
-        for p in players:
-            if df.loc[p, 'Player'] in locks: prob += pulp.lpSum([x[p][s] for s in slots]) == 1
+            prob += pulp.lpSum([df.loc[p, 'Solver_Proj'] * x[p][s] for p in players for s in slots])
+            prob += pulp.lpSum([df.loc[p, 'Salary'] * x[p][s] for p in players for s in slots]) <= 50000
 
-        for p in players:
-            pos = str(df.loc[p, 'POS'])
-            for s in slots:
-                if (s.startswith('P') and 'P' not in pos) or (s == 'C' and 'C' not in pos) or \
-                        (s == '1B' and '1B' not in pos) or (s == '2B' and '2B' not in pos) or \
-                        (s == '3B' and '3B' not in pos) or (s == 'SS' and 'SS' not in pos) or \
-                        (s.startswith('OF') and 'OF' not in pos): prob += x[p][s] == 0
-
-        for t in df['Team'].unique():
-            h_idx = df[(df['Team'] == t) & (~df['POS'].str.contains('P', na=False))].index.tolist()
-            prob += pulp.lpSum([x[p][s] for p in h_idx for s in slots]) <= 5
-            if stack_team == t:
-                prob += pulp.lpSum([x[p][s] for p in h_idx for s in slots]) >= min_stack
-
-        for sol in past_solutions:
-            prob += pulp.lpSum([x[p][s] for p in sol for s in slots]) <= (len(slots) - diversity)
-
-        prob.solve(pulp.PULP_CBC_CMD(msg=0))
-        if pulp.LpStatus[prob.status] == 'Optimal':
-            lineup_data, player_indices = [], []
-            total_sal, total_proj = 0, 0
+            for s in slots: prob += pulp.lpSum([x[p][s] for p in players]) == 1
+            for p in players: prob += pulp.lpSum([x[p][s] for s in slots]) <= 1
             for p in players:
-                for s in slots:
-                    if x[p][s].varValue == 1:
-                        total_sal += df.loc[p, 'Salary'];
-                        total_proj += df.loc[p, 'Proj']
-                        b_clean, o_clean = df.loc[p, 'CleanHand'], p_hand_map.get(df.loc[p, 'Opponent'], '?')
-                        lineup_data.append({
-                            'Slot': s, 'Name': df.loc[p, 'Player'], 'Team': df.loc[p, 'Team'],
-                            'Hand': df.loc[p, 'Hand'], 'OppP': "—" if s.startswith('P') else o_clean,
-                            'Adv': False if s.startswith('P') else check_adv(b_clean, o_clean),
-                            'Order': int(df.loc[p, 'Batting Order']) if df.loc[p, 'Batting Order'] > 0 else '—',
-                            'Proj': round(df.loc[p, 'Proj'], 2), 'Salary': df.loc[p, 'Salary'], 'SortKey': POS_ORDER[s]
-                        })
-                        player_indices.append(p)
-            lineup_data.sort(key=lambda x: x['SortKey'])
-            all_results.append(
-                {'players': lineup_data, 'total_salary': total_sal, 'total_projection': round(total_proj, 2)})
-            past_solutions.append(player_indices)
-        else:
-            break
-    return all_results
+                if df.loc[p, 'Player'] in locks: prob += pulp.lpSum([x[p][s] for s in slots]) == 1
 
+            for p in players:
+                pos = str(df.loc[p, 'POS'])
+                for s in slots:
+                    if (s.startswith('P') and 'P' not in pos) or (s == 'C' and 'C' not in pos) or \
+                       (s == '1B' and '1B' not in pos) or (s == '2B' and '2B' not in pos) or \
+                       (s == '3B' and '3B' not in pos) or (s == 'SS' and 'SS' not in pos) or \
+                       (s.startswith('OF') and 'OF' not in pos): prob += x[p][s] == 0
+
+            for past_indices in used_player_indices:
+                prob += pulp.lpSum([x[p][s] for p in past_indices for s in slots]) <= (len(slots) - diversity)
+
+            h_idx = df[(df['Team'] == current_team) & (~df['POS'].str.contains('P', na=False))].index.tolist()
+            if len(h_idx) >= int(min_stack):
+                prob += pulp.lpSum([x[p][s] for p in h_idx for s in slots]) >= int(min_stack)
+            else: continue
+
+            prob.solve(pulp.PULP_CBC_CMD(msg=0))
+
+            if pulp.LpStatus[prob.status] == 'Optimal':
+                score = pulp.value(prob.objective)
+                if score > highest_score:
+                    highest_score = score
+                    lineup_data, p_indices = [], []
+                    total_sal, total_proj = 0, 0
+                    for p in players:
+                        for s in slots:
+                            if x[p][s].varValue == 1:
+                                row = df.loc[p]
+                                b_h, o_h = row['CleanHand'], p_hand_map.get(row['Opponent'], '?')
+                                lineup_data.append({
+                                    'Slot': s, 'Name': row['Player'], 'Team': row['Team'], 'Hand': row['Hand'],
+                                    'OppP': "—" if s.startswith('P') else o_h,
+                                    'Adv': False if s.startswith('P') else (b_h == 'S' or (b_h == 'L' and o_h == 'R') or (b_h == 'R' and o_h == 'L')),
+                                    'Proj': round(row['Proj'], 2), 'Salary': row['Salary'], 'SortKey': POS_ORDER[s]
+                                })
+                                p_indices.append(p)
+                                total_sal += row['Salary']
+                                total_proj += row['Proj']
+                    lineup_data.sort(key=lambda x: x['SortKey'])
+                    best_lineup_for_pass = {'players': lineup_data, 'total_salary': total_sal, 'total_projection': round(total_proj, 2), 'indices': p_indices}
+
+        if best_lineup_for_pass:
+            all_results.append(best_lineup_for_pass)
+            used_player_indices.append(best_lineup_for_pass['indices'])
+        else: break
+    return all_results
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
-    live_slate = get_today_slate();
+    live_slate = get_today_slate()
     h_fg, p_fg = get_weighted_stats()
     df_raw = pd.read_csv(SALARY_CSV)
 
     df_raw['CleanHand'] = df_raw['Hand'].apply(clean_hand_str)
     df_raw['Salary'] = pd.to_numeric(df_raw['Salary'].astype(str).replace(r'[\$,]', '', regex=True).apply(
         lambda x: float(x.replace('k', '')) * 1000 if 'k' in x else x), errors='coerce').fillna(0)
-    df_raw['Batting Order'] = pd.to_numeric(df_raw['Batting Order'], errors='coerce').fillna(0)
     df_raw['Proj'] = pd.to_numeric(df_raw['Projected Points'], errors='coerce').fillna(0)
 
     if not h_fg.empty: df_raw = df_raw.merge(h_fg, left_on='Player', right_on='Name', how='left').fillna(0)
@@ -187,14 +182,12 @@ def index():
     pitchers_df = df_raw[df_raw['POS'].str.contains('P', na=False)]
     p_hand_map = pitchers_df.set_index('Team')['CleanHand'].to_dict()
 
-    pool_list = []
-    unique_games = set()
+    pool_list, unique_games = [], set()
     for _, r in df_raw.iterrows():
-        p_data = r.to_dict();
+        p_data = r.to_dict()
         b_clean, o_clean = r['CleanHand'], p_hand_map.get(r['Opponent'], '?')
         p_data['OppP'] = "—" if 'P' in str(r['POS']) else o_clean
-        p_data['Adv'] = False if 'P' in str(r['POS']) else (
-                    b_clean == 'S' or (b_clean == 'L' and o_clean == 'R') or (b_clean == 'R' and o_clean == 'L'))
+        p_data['Adv'] = False if 'P' in str(r['POS']) else (b_clean == 'S' or (b_clean == 'L' and o_clean == 'R') or (b_clean == 'R' and o_clean == 'L'))
         pool_list.append(p_data)
         t1, t2 = TEAM_MAP.get(str(r['Team']), str(r['Team'])), TEAM_MAP.get(str(r['Opponent']), str(r['Opponent']))
         unique_games.add(" vs ".join(sorted([t1, t2])))
@@ -202,10 +195,8 @@ def index():
     available_games = []
     for g in sorted(list(unique_games)):
         game_info = live_slate.get(g, {'time': 'TBD', 't1_locked': False, 't2_locked': False})
-        t1_icon = '<span style="color:#00ff41;">✔</span>' if game_info[
-            't1_locked'] else '<span style="color:#ff4b4b;">✘</span>'
-        t2_icon = '<span style="color:#00ff41;">✔</span>' if game_info[
-            't2_locked'] else '<span style="color:#ff4b4b;">✘</span>'
+        t1_icon = '<span style="color:#00ff41;">✔</span>' if game_info['t1_locked'] else '<span style="color:#ff4b4b;">✘</span>'
+        t2_icon = '<span style="color:#00ff41;">✔</span>' if game_info['t2_locked'] else '<span style="color:#ff4b4b;">✘</span>'
         available_games.append({"id": g, "display": f"{g} ({game_info['time']})", "indicator": f"{t1_icon}{t2_icon}"})
 
     results, status = None, "Ready."
@@ -213,15 +204,12 @@ def index():
         results = run_optimizer(df_raw, num_lineups=int(request.form.get('num_lineups', 5)),
                                 locks=request.form.getlist('player_locks'),
                                 stack_team=request.form.get('stack_team'),
+                                min_stack=request.form.get('min_stack', 3),
                                 diversity=int(request.form.get('diversity', 4)),
-                                excluded_games=[g['id'] for g in available_games if
-                                                g['id'] not in request.form.getlist('games')])
+                                excluded_games=[g['id'] for g in available_games if g['id'] not in request.form.getlist('games')])
         status = f"Generated {len(results)} lineups."
 
-    return render_template_string(HTML_BODY, results=results, status=status,
-                                  teams=sorted(df_raw['Team'].dropna().unique()),
-                                  games=available_games, pool=pool_list)
-
+    return render_template_string(HTML_BODY, results=results, status=status, teams=sorted(df_raw['Team'].dropna().unique()), games=available_games, pool=pool_list)
 
 HTML_BODY = """
 <!DOCTYPE html>
@@ -243,7 +231,7 @@ HTML_BODY = """
         td { padding: 10px 8px; border-bottom: 1px solid #21262d; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .sticky-head { position: sticky; top: 0; background: var(--card); z-index: 10; }
         .hand-adv { background: #238636; color: white; padding: 2px 6px; border-radius: 4px; font-weight: bold; }
-        .hand-neut { background: var(--gray); color: #c9d1d9; padding: 2px 6px; border-radius: 4px; font-size: 0.85em; }
+        .hand-neut { background: #30363d; color: #c9d1d9; padding: 2px 6px; border-radius: 4px; font-size: 0.85em; }
         .edge-col { color: var(--edge); font-weight: bold; }
         .chalk-col { color: var(--chalk); font-weight: bold; }
     </style>
@@ -256,12 +244,18 @@ HTML_BODY = """
         <div class="grid">
             <div class="card">
                 <h3>Settings</h3>
-                Lineups: <input type="number" name="num_lineups" value="5" style="width:50px;">
-                Div: <input type="number" name="diversity" value="4" style="width:50px;"><br><br>
-                Stack: <select name="stack_team" style="width:100%;">
-                    <option value="None">Auto-Select Best</option>
-                    {% for team in teams %}<option value="{{ team }}">{{ team }}</option>{% endfor %}
-                </select><br><br>
+                <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
+                    <div>Lineups: <input type="number" name="num_lineups" value="5" style="width:100%;"></div>
+                    <div>Diversity: <input type="number" name="diversity" value="4" style="width:100%;"></div>
+                    <div>Stack Team: 
+                        <select name="stack_team" style="width:100%;">
+                            <option value="None">Auto-Select Best</option>
+                            {% for team in teams %}<option value="{{ team }}">{{ team }}</option>{% endfor %}
+                        </select>
+                    </div>
+                    <div>Min Stack Size: <input type="number" name="min_stack" value="3" min="0" max="5" style="width:100%;"></div>
+                </div>
+                <br>
                 <button type="submit" style="width:100%; padding:12px;">GENERATE LINEUPS</button>
             </div>
             <div class="card">
@@ -279,7 +273,7 @@ HTML_BODY = """
 
         <div class="card">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
-                <h3 style="margin:0;">Player Pool (Weighted 2025-26 Stats)</h3>
+                <h3 style="margin:0;">Player Pool</h3>
                 <input type="text" id="playerSearch" placeholder="Filter..." style="max-width:200px;">
             </div>
             <div style="max-height:500px; overflow-y:auto; border:1px solid var(--border); border-radius:6px;">
