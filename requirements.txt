@@ -4,3 +4,4 @@ pulp
 requests
 pytz
 gunicorn
+pybaseball
