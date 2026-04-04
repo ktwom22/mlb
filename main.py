@@ -2,10 +2,12 @@ import pandas as pd
 import pulp
 import re
 import requests
+import unicodedata
+import random  # Added for fuzzing
 from flask import Flask, render_template_string, request
 from datetime import datetime
 import pytz
-from pybaseball import batting_stats, pitching_stats
+from pybaseball import batting_stats, pitching_stats, statcast_pitcher_exitvelo_barrels
 
 app = Flask(__name__)
 
@@ -22,6 +24,17 @@ TEAM_MAP = {
     "SLN": "STL", "CHC": "CHC", "CHN": "CHC", "TOR": "TOR", "COL": "COL", "ATL": "ATL"
 }
 
+
+def normalize_name(name):
+    if not isinstance(name, str): return ""
+    name = "".join(c for c in unicodedata.normalize('NFD', name) if unicodedata.category(c) != 'Mn')
+    name = re.sub(r'[^a-zA-Z\s]', '', name).lower().strip()
+    suffixes = [' jr', ' sr', ' iii', ' ii', ' iv']
+    for s in suffixes:
+        if name.endswith(s): name = name[:-len(s)]
+    return name.strip()
+
+
 def clean_hand_str(h):
     if pd.isna(h): return "?"
     s = str(h).upper()
@@ -29,6 +42,7 @@ def clean_hand_str(h):
     if 'L' in s: return 'L'
     if 'S' in s: return 'S'
     return "?"
+
 
 def get_today_slate():
     url = "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard"
@@ -49,55 +63,99 @@ def get_today_slate():
     except:
         return {}
 
+
 def get_weighted_stats():
     try:
-        h26 = batting_stats(2026); h25 = batting_stats(2025)
+        print("Fetching pybaseball stats...")
+        h26 = batting_stats(2026);
+        h25 = batting_stats(2025)
         h_merge = pd.merge(h26, h25, on='Name', how='outer', suffixes=('_26', '_25')).fillna(0)
         h_merge['W_Barrel'] = (h_merge['Barrel%_26'] * 0.7) + (h_merge['Barrel%_25'] * 0.3)
         h_merge['W_xwOBA'] = (h_merge['xwOBA_26'] * 0.7) + (h_merge['xwOBA_25'] * 0.3)
         h_merge['W_BB'] = (h_merge['BB%_26'] * 0.7) + (h_merge['BB%_25'] * 0.3)
-        h_merge['Edge_Value'] = (h_merge['W_Barrel'] * 40) + (h_merge['W_xwOBA'] * 40) + (h_merge['W_BB'] * 20)
-        h_final = h_merge[['Name', 'Edge_Value', 'W_Barrel', 'W_xwOBA']].rename(columns={'W_Barrel': 'Barrel%', 'W_xwOBA': 'xwOBA'})
+        # Edge_Value normalized to a roughly 0-15 point scale
+        h_merge['Edge_Value'] = (h_merge['W_Barrel'] * 50) + (h_merge['W_xwOBA'] * 20) + (h_merge['W_BB'] * 5)
+        h_merge['norm_name'] = h_merge['Name'].apply(normalize_name)
+        h_final = h_merge[['norm_name', 'Edge_Value', 'W_Barrel', 'W_xwOBA']].rename(
+            columns={'W_Barrel': 'Barrel%', 'W_xwOBA': 'xwOBA'})
 
-        p26 = pitching_stats(2026); p25 = pitching_stats(2025)
+        raw_barrels = statcast_pitcher_exitvelo_barrels(2025)
+        if 'last_name, first_name' in raw_barrels.columns:
+            raw_barrels['Name'] = raw_barrels['last_name, first_name'].apply(
+                lambda x: ' '.join(reversed(x.split(', '))) if isinstance(x, str) else x
+            )
+        p_barrels = raw_barrels[['Name', 'brl_percent']].rename(columns={'brl_percent': 'Pitcher_Brl%'})
+
+        p26 = pitching_stats(2026);
+        p25 = pitching_stats(2025)
         p_merge = pd.merge(p26, p25, on='Name', how='outer', suffixes=('_26', '_25')).fillna(0)
         p_merge['W_SIERA'] = (p_merge['SIERA_26'] * 0.7) + (p_merge['SIERA_25'] * 0.3)
         p_merge['W_KBB'] = (p_merge['K-BB%_26'] * 0.7) + (p_merge['K-BB%_25'] * 0.3)
         p_merge['W_SwStr'] = (p_merge['SwStr%_26'] * 0.7) + (p_merge['SwStr%_25'] * 0.3)
-        p_merge['Chalk_Quality'] = (p_merge['W_KBB'] * 100) + (10 / p_merge['W_SIERA'].replace(0, 5)) + (p_merge['W_SwStr'] * 100)
-        p_final = p_merge[['Name', 'Chalk_Quality', 'W_SIERA', 'W_KBB']].rename(columns={'W_SIERA': 'SIERA', 'W_KBB': 'K-BB%'})
+
+        p_combined = pd.merge(p_merge, p_barrels, on='Name', how='left').fillna(0)
+        p_combined['Chalk_Quality'] = (p_combined['W_KBB'] * 100) + (10 / p_combined['W_SIERA'].replace(0, 5)) + (
+                    p_combined['W_SwStr'] * 100)
+        p_combined['norm_name'] = p_combined['Name'].apply(normalize_name)
+
+        p_final = p_combined[['norm_name', 'Chalk_Quality', 'W_SIERA', 'W_KBB', 'Pitcher_Brl%']].rename(
+            columns={'W_SIERA': 'SIERA', 'W_KBB': 'K-BB%'})
         return h_final, p_final
-    except:
+    except Exception as e:
+        print(f"Stats Error: {e}")
         return pd.DataFrame(), pd.DataFrame()
+
 
 def run_optimizer(df_input, num_lineups=1, locks=[], stack_team=None, min_stack=3, diversity=4, excluded_games=[]):
     df = df_input.copy()
     all_results = []
     used_player_indices = []
 
-    # 1. Filter excluded games
     if excluded_games:
         for gid in excluded_games:
             teams_in_game = gid.split(" vs ")
             df = df[~df['Team'].isin(teams_in_game)]
 
-    # 2. Rebuild Pitcher Hand Map for Platoon Adv
     pitchers_df = df[df['POS'].str.contains('P', na=False)]
     p_hand_map = pitchers_df.set_index('Team')['CleanHand'].to_dict()
+    p_barrel_map = pitchers_df.set_index('Team')['Pitcher_Brl%'].to_dict()
 
     def apply_logic(row):
+        # Start with the original projection
         base_proj = row['Proj']
+
+        # 1. Pitcher Logic (Stronger Weighting)
         if 'P' in str(row['POS']):
-            return base_proj * (1 + (row.get('Chalk_Quality', 0) / 400)) if row.get('Chalk_Quality', 0) > 0 else base_proj
-        if row.get('Edge_Value', 0) > 0:
-            base_proj = (base_proj * 0.85) + (row['Edge_Value'] * 0.15)
-        # Platoon Adv (12%)
-        b_clean, o_clean = row['CleanHand'], p_hand_map.get(row['Opponent'], '?')
-        if b_clean == 'S' or (b_clean == 'L' and o_clean == 'R') or (b_clean == 'R' and o_clean == 'L'):
-            base_proj *= 1.12
-        return base_proj
+            bonus = (row.get('Chalk_Quality', 0) / 250)
+            final_proj = base_proj * (1 + bonus)
+        else:
+            # 2. Hitter Edge (50% Influence from Statcast)
+            if row.get('Edge_Value', 0) > 0:
+                stat_val = row['Edge_Value']
+                base_proj = (base_proj * 0.50) + (stat_val * 0.50)
+
+            # 3. NIGHTLY CEILING (Aggressive 25% bump)
+            opp_brl = p_barrel_map.get(row['Opponent'], 0)
+            if opp_brl > 10.5:
+                base_proj *= 1.25
+
+            # 4. Platoon Advantage
+            b_clean, o_clean = row['CleanHand'], p_hand_map.get(row['Opponent'], '?')
+            if b_clean == 'S' or (b_clean == 'L' and o_clean == 'R') or (b_clean == 'R' and o_clean == 'L'):
+                base_proj *= 1.12
+
+            final_proj = base_proj
+
+        # 5. FUZZING / RANDOMNESS (±6% Variance)
+        # This forces the solver to find different 'optimal' paths each run
+        fuzz = random.uniform(0.94, 1.06)
+        return final_proj * fuzz
 
     df['Solver_Proj'] = df.apply(apply_logic, axis=1)
+
+    diff_count = (df['Solver_Proj'] != df['Proj']).sum()
+    print(f"Optimizer: Applying weights & fuzzing to {diff_count} players.")
+
     teams_to_stack = [stack_team] if (stack_team and stack_team != "None") else df['Team'].unique()
 
     for i in range(num_lineups):
@@ -122,9 +180,9 @@ def run_optimizer(df_input, num_lineups=1, locks=[], stack_team=None, min_stack=
                 pos = str(df.loc[p, 'POS'])
                 for s in slots:
                     if (s.startswith('P') and 'P' not in pos) or (s == 'C' and 'C' not in pos) or \
-                       (s == '1B' and '1B' not in pos) or (s == '2B' and '2B' not in pos) or \
-                       (s == '3B' and '3B' not in pos) or (s == 'SS' and 'SS' not in pos) or \
-                       (s.startswith('OF') and 'OF' not in pos): prob += x[p][s] == 0
+                            (s == '1B' and '1B' not in pos) or (s == '2B' and '2B' not in pos) or \
+                            (s == '3B' and '3B' not in pos) or (s == 'SS' and 'SS' not in pos) or \
+                            (s.startswith('OF') and 'OF' not in pos): prob += x[p][s] == 0
 
             for past_indices in used_player_indices:
                 prob += pulp.lpSum([x[p][s] for p in past_indices for s in slots]) <= (len(slots) - diversity)
@@ -132,7 +190,8 @@ def run_optimizer(df_input, num_lineups=1, locks=[], stack_team=None, min_stack=
             h_idx = df[(df['Team'] == current_team) & (~df['POS'].str.contains('P', na=False))].index.tolist()
             if len(h_idx) >= int(min_stack):
                 prob += pulp.lpSum([x[p][s] for p in h_idx for s in slots]) >= int(min_stack)
-            else: continue
+            else:
+                continue
 
             prob.solve(pulp.PULP_CBC_CMD(msg=0))
 
@@ -150,34 +209,40 @@ def run_optimizer(df_input, num_lineups=1, locks=[], stack_team=None, min_stack=
                                 lineup_data.append({
                                     'Slot': s, 'Name': row['Player'], 'Team': row['Team'], 'Hand': row['Hand'],
                                     'OppP': "—" if s.startswith('P') else o_h,
-                                    'Adv': False if s.startswith('P') else (b_h == 'S' or (b_h == 'L' and o_h == 'R') or (b_h == 'R' and o_h == 'L')),
-                                    'Proj': round(row['Proj'], 2), 'Salary': row['Salary'], 'SortKey': POS_ORDER[s]
+                                    'Adv': False if s.startswith('P') else (
+                                                b_h == 'S' or (b_h == 'L' and o_h == 'R') or (
+                                                    b_h == 'R' and o_h == 'L')),
+                                    'Proj': round(row['Solver_Proj'], 2),
+                                    'Salary': row['Salary'], 'SortKey': POS_ORDER[s]
                                 })
                                 p_indices.append(p)
                                 total_sal += row['Salary']
-                                total_proj += row['Proj']
+                                total_proj += row['Solver_Proj']
                     lineup_data.sort(key=lambda x: x['SortKey'])
-                    best_lineup_for_pass = {'players': lineup_data, 'total_salary': total_sal, 'total_projection': round(total_proj, 2), 'indices': p_indices}
+                    best_lineup_for_pass = {'players': lineup_data, 'total_salary': total_sal,
+                                            'total_projection': round(total_proj, 2), 'indices': p_indices}
 
         if best_lineup_for_pass:
             all_results.append(best_lineup_for_pass)
             used_player_indices.append(best_lineup_for_pass['indices'])
-        else: break
+        else:
+            break
     return all_results
+
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
     live_slate = get_today_slate()
     h_fg, p_fg = get_weighted_stats()
     df_raw = pd.read_csv(SALARY_CSV)
-
+    df_raw['norm_name'] = df_raw['Player'].apply(normalize_name)
     df_raw['CleanHand'] = df_raw['Hand'].apply(clean_hand_str)
     df_raw['Salary'] = pd.to_numeric(df_raw['Salary'].astype(str).replace(r'[\$,]', '', regex=True).apply(
-        lambda x: float(x.replace('k', '')) * 1000 if 'k' in x else x), errors='coerce').fillna(0)
+        lambda x: float(x.replace('k', '')) * 1000 if 'k' in x.lower() else x), errors='coerce').fillna(0)
     df_raw['Proj'] = pd.to_numeric(df_raw['Projected Points'], errors='coerce').fillna(0)
 
-    if not h_fg.empty: df_raw = df_raw.merge(h_fg, left_on='Player', right_on='Name', how='left').fillna(0)
-    if not p_fg.empty: df_raw = df_raw.merge(p_fg, left_on='Player', right_on='Name', how='left').fillna(0)
+    if not h_fg.empty: df_raw = df_raw.merge(h_fg, on='norm_name', how='left').fillna(0)
+    if not p_fg.empty: df_raw = df_raw.merge(p_fg, on='norm_name', how='left').fillna(0)
 
     pitchers_df = df_raw[df_raw['POS'].str.contains('P', na=False)]
     p_hand_map = pitchers_df.set_index('Team')['CleanHand'].to_dict()
@@ -187,7 +252,8 @@ def index():
         p_data = r.to_dict()
         b_clean, o_clean = r['CleanHand'], p_hand_map.get(r['Opponent'], '?')
         p_data['OppP'] = "—" if 'P' in str(r['POS']) else o_clean
-        p_data['Adv'] = False if 'P' in str(r['POS']) else (b_clean == 'S' or (b_clean == 'L' and o_clean == 'R') or (b_clean == 'R' and o_clean == 'L'))
+        p_data['Adv'] = False if 'P' in str(r['POS']) else (
+                    b_clean == 'S' or (b_clean == 'L' and o_clean == 'R') or (b_clean == 'R' and o_clean == 'L'))
         pool_list.append(p_data)
         t1, t2 = TEAM_MAP.get(str(r['Team']), str(r['Team'])), TEAM_MAP.get(str(r['Opponent']), str(r['Opponent']))
         unique_games.add(" vs ".join(sorted([t1, t2])))
@@ -195,8 +261,10 @@ def index():
     available_games = []
     for g in sorted(list(unique_games)):
         game_info = live_slate.get(g, {'time': 'TBD', 't1_locked': False, 't2_locked': False})
-        t1_icon = '<span style="color:#00ff41;">✔</span>' if game_info['t1_locked'] else '<span style="color:#ff4b4b;">✘</span>'
-        t2_icon = '<span style="color:#00ff41;">✔</span>' if game_info['t2_locked'] else '<span style="color:#ff4b4b;">✘</span>'
+        t1_icon = '<span style="color:#00ff41;">✔</span>' if game_info[
+            't1_locked'] else '<span style="color:#ff4b4b;">✘</span>'
+        t2_icon = '<span style="color:#00ff41;">✔</span>' if game_info[
+            't2_locked'] else '<span style="color:#ff4b4b;">✘</span>'
         available_games.append({"id": g, "display": f"{g} ({game_info['time']})", "indicator": f"{t1_icon}{t2_icon}"})
 
     results, status = None, "Ready."
@@ -206,10 +274,13 @@ def index():
                                 stack_team=request.form.get('stack_team'),
                                 min_stack=request.form.get('min_stack', 3),
                                 diversity=int(request.form.get('diversity', 4)),
-                                excluded_games=[g['id'] for g in available_games if g['id'] not in request.form.getlist('games')])
-        status = f"Generated {len(results)} lineups."
+                                excluded_games=[g['id'] for g in available_games if
+                                                g['id'] not in request.form.getlist('games')])
+        status = f"Generated {len(results)} lineups using Weighted Stats & Fuzzing."
 
-    return render_template_string(HTML_BODY, results=results, status=status, teams=sorted(df_raw['Team'].dropna().unique()), games=available_games, pool=pool_list)
+    return render_template_string(HTML_BODY, results=results, status=status,
+                                  teams=sorted(df_raw['Team'].dropna().unique()), games=available_games, pool=pool_list)
+
 
 HTML_BODY = """
 <!DOCTYPE html>
@@ -238,7 +309,7 @@ HTML_BODY = """
 </head>
 <body>
 <div class="container">
-    <div class="header"><h1 style="color: var(--accent); margin:0;">BETIFY MLB PRO + WEIGHTED EDGE</h1></div>
+    <div class="header"><h1 style="color: var(--accent); margin:0;">BETIFY MLB PRO + NIGHTLY UPSIDE</h1></div>
     <div class="status-bar">SYSTEM STATUS: {{ status }}</div>
     <form method="post">
         <div class="grid">
