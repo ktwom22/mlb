@@ -28,13 +28,26 @@ TEAM_MAP = {
     "SLN": "STL", "CHC": "CHC", "CHN": "CHC", "TOR": "TOR", "COL": "COL", "ATL": "ATL"
 }
 
+TEAM_ID_MAP = {
+    "ARI": 109, "ATL": 144, "BAL": 110, "BOS": 111, "CHC": 112, "CWS": 145,
+    "CIN": 113, "CLE": 114, "COL": 115, "DET": 116, "HOU": 117, "KC": 118,
+    "LAA": 108, "LAD": 119, "MIA": 146, "MIL": 158, "MIN": 142, "NYM": 121,
+    "NYY": 147, "OAK": 133, "PHI": 143, "PIT": 134, "SD": 135, "SF": 137,
+    "SEA": 136, "STL": 138, "TB": 139, "TEX": 140, "TOR": 141, "WAS": 120
+}
+
+
+def get_logo_url(team_abbr):
+    clean_abbr = TEAM_MAP.get(team_abbr, team_abbr)
+    tid = TEAM_ID_MAP.get(clean_abbr)
+    return f"https://www.mlbstatic.com/team-logos/team-cap-on-light/{tid}.svg" if tid else "https://www.mlbstatic.com/team-logos/league/1.svg"
+
 
 def normalize_name(name):
     if not isinstance(name, str): return ""
     name = "".join(c for c in unicodedata.normalize('NFD', name) if unicodedata.category(c) != 'Mn')
     name = re.sub(r'[^a-zA-Z\s]', '', name).lower().strip()
-    suffixes = [' jr', ' sr', ' iii', ' ii', ' iv']
-    for s in suffixes:
+    for s in [' jr', ' sr', ' iii', ' ii', ' iv']:
         if name.endswith(s): name = name[:-len(s)]
     return name.strip()
 
@@ -42,27 +55,27 @@ def normalize_name(name):
 def clean_hand_str(h):
     if pd.isna(h): return "?"
     s = str(h).upper()
-    if 'R' in s: return 'R'
-    if 'L' in s: return 'L'
-    if 'S' in s: return 'S'
-    return "?"
+    return s[0] if s and s[0] in 'RLS' else "?"
 
 
 def get_espn_game_times():
-    url = "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard"
+    now_et = datetime.now(pytz.timezone('US/Eastern'))
+    today_str = now_et.strftime('%Y%m%d')
+    url = f"https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard?dates={today_str}&limit=100"
     slate_times = {}
     try:
-        data = requests.get(url).json()
+        data = requests.get(url, timeout=5).json()
         for event in data.get('events', []):
-            competitors = event['competitions'][0]['competitors']
-            raw_names = [t['team']['abbreviation'] for t in competitors]
-            mapped_names = sorted([TEAM_MAP.get(name, name) for name in raw_names])
-            game_id = " vs ".join(mapped_names)
+            competitions = event.get('competitions', [{}])[0]
+            competitors = competitions.get('competitors', [])
+            raw_names = [TEAM_MAP.get(t['team']['abbreviation'].upper(), t['team']['abbreviation'].upper()) for t in
+                         competitors]
+            game_id = " vs ".join(sorted(raw_names))
             utc_time = datetime.strptime(event['date'], "%Y-%m-%dT%H:%MZ").replace(tzinfo=pytz.utc)
-            et_time = utc_time.astimezone(pytz.timezone('US/Eastern')).strftime('%I:%M %p')
-            slate_times[game_id] = et_time
-    except:
-        pass
+            et_dt = utc_time.astimezone(pytz.timezone('US/Eastern'))
+            slate_times[game_id] = {'display': et_dt.strftime('%I:%M %p'), 'raw': et_dt}
+    except Exception as e:
+        print(f"ESPN Error: {e}")
     return slate_times
 
 
@@ -70,16 +83,12 @@ def get_weighted_stats():
     global _STATS_CACHE
     if _STATS_CACHE['h'] is not None and (time.time() - _STATS_CACHE['time']) < 600:
         return _STATS_CACHE['h'], _STATS_CACHE['p']
-
     try:
-        print("Fetching pybaseball stats...")
-        h26 = batting_stats(2026);
-        h25 = batting_stats(2025)
+        h26, h25 = batting_stats(2026), batting_stats(2025)
         h_merge = pd.merge(h26, h25, on='Name', how='outer', suffixes=('_26', '_25')).fillna(0)
         h_merge['W_Barrel'] = (h_merge['Barrel%_26'] * 0.7) + (h_merge['Barrel%_25'] * 0.3)
         h_merge['W_xwOBA'] = (h_merge['xwOBA_26'] * 0.7) + (h_merge['xwOBA_25'] * 0.3)
-        h_merge['W_BB'] = (h_merge['BB%_26'] * 0.7) + (h_merge['BB%_25'] * 0.3)
-        h_merge['Edge_Value'] = (h_merge['W_Barrel'] * 50) + (h_merge['W_xwOBA'] * 20) + (h_merge['W_BB'] * 5)
+        h_merge['Edge_Value'] = (h_merge['W_Barrel'] * 50) + (h_merge['W_xwOBA'] * 20)
         h_merge['norm_name'] = h_merge['Name'].apply(normalize_name)
         h_final = h_merge[['norm_name', 'Edge_Value', 'W_Barrel', 'W_xwOBA']].rename(
             columns={'W_Barrel': 'Barrel%', 'W_xwOBA': 'xwOBA'})
@@ -90,23 +99,19 @@ def get_weighted_stats():
                 lambda x: ' '.join(reversed(x.split(', '))) if isinstance(x, str) else x)
         p_barrels = raw_barrels[['Name', 'brl_percent']].rename(columns={'brl_percent': 'Pitcher_Brl%'})
 
-        p26 = pitching_stats(2026);
-        p25 = pitching_stats(2025)
+        p26, p25 = pitching_stats(2026), pitching_stats(2025)
         p_merge = pd.merge(p26, p25, on='Name', how='outer', suffixes=('_26', '_25')).fillna(0)
         p_merge['W_SIERA'] = (p_merge['SIERA_26'] * 0.7) + (p_merge['SIERA_25'] * 0.3)
         p_merge['W_KBB'] = (p_merge['K-BB%_26'] * 0.7) + (p_merge['K-BB%_25'] * 0.3)
-        p_merge['W_SwStr'] = (p_merge['SwStr%_26'] * 0.7) + (p_merge['SwStr%_25'] * 0.3)
         p_combined = pd.merge(p_merge, p_barrels, on='Name', how='left').fillna(0)
-        p_combined['Chalk_Quality'] = (p_combined['W_KBB'] * 120) + (15 / p_combined['W_SIERA'].replace(0, 5)) + (
-                    p_combined['W_SwStr'] * 100)
+        p_combined['Chalk_Quality'] = (p_combined['W_KBB'] * 120) + (15 / p_combined['W_SIERA'].replace(0, 5))
         p_combined['norm_name'] = p_combined['Name'].apply(normalize_name)
         p_final = p_combined[['norm_name', 'Chalk_Quality', 'W_SIERA', 'W_KBB', 'Pitcher_Brl%']].rename(
             columns={'W_SIERA': 'SIERA', 'W_KBB': 'K-BB%'})
 
         _STATS_CACHE['h'], _STATS_CACHE['p'], _STATS_CACHE['time'] = h_final, p_final, time.time()
         return h_final, p_final
-    except Exception as e:
-        print(f"Stats Error: {e}")
+    except:
         return pd.DataFrame(), pd.DataFrame()
 
 
@@ -119,100 +124,89 @@ def run_optimizer(df_input, num_lineups=1, locks=[], stack_team=None, min_stack=
 
     if excluded_games:
         for gid in excluded_games:
-            teams_in_game = gid.split(" vs ")
-            df = df[~df['Team'].isin(teams_in_game)]
+            teams = gid.split(" vs ")
+            df = df[~df['Team'].isin(teams)]
 
-    pitchers_df = df[df['POS'].str.contains('P', na=False)]
-    p_hand_map = pitchers_df.set_index('Team')['CleanHand'].to_dict()
-    p_barrel_map = pitchers_df.set_index('Team')['Pitcher_Brl%'].to_dict()
+    p_hand_map = df[df['POS'].str.contains('P', na=False)].set_index('Team')['CleanHand'].to_dict()
+    p_barrel_map = df[df['POS'].str.contains('P', na=False)].set_index('Team')['Pitcher_Brl%'].to_dict()
 
     def apply_logic(row):
-        base_proj = row['Proj']
-        salary = max(row['Salary'], 3000)
+        proj = row['Proj']
         if 'P' in str(row['POS']):
-            # SALARY-ADJUSTED CHALK
-            value_factor = (base_proj / (salary / 1000))
-            bonus = (row.get('Chalk_Quality', 0) / 150) * (value_factor / 3.0)
-            final_proj = base_proj * (1.1 + bonus)
+            proj *= (1.1 + (row.get('Chalk_Quality', 0) / 180))
         else:
-            if row.get('Edge_Value', 0) > 0:
-                base_proj = (base_proj * 0.50) + (row['Edge_Value'] * 0.50)
-            if p_barrel_map.get(row['Opponent'], 0) > 10.5: base_proj *= 1.25
-            b_clean, o_clean = row['CleanHand'], p_hand_map.get(row['Opponent'], '?')
-            if b_clean == 'S' or (b_clean == 'L' and o_clean == 'R') or (b_clean == 'R' and o_clean == 'L'):
-                base_proj *= 1.12
-            final_proj = base_proj
-        return final_proj * random.uniform(0.97, 1.03)
+            if row.get('Edge_Value', 0) > 0: proj = (proj * 0.5) + (row['Edge_Value'] * 0.5)
+            if p_barrel_map.get(row['Opponent'], 0) > 10.5: proj *= 1.25
+            b_h, o_h = row['CleanHand'], p_hand_map.get(row['Opponent'], '?')
+            if b_h == 'S' or (b_h == 'L' and o_h == 'R') or (b_h == 'R' and o_h == 'L'): proj *= 1.12
+        return proj * random.uniform(0.96, 1.04)
 
     df['Solver_Proj'] = df.apply(apply_logic, axis=1)
-
-    # Smart Stacking: Only loop through high-upside teams to save time
-    if not stack_team or stack_team == "None":
-        team_projs = df[~df['POS'].str.contains('P')].groupby('Team')['Solver_Proj'].mean().sort_values(ascending=False)
-        teams_to_stack = team_projs.head(8).index.tolist()
-    else:
-        teams_to_stack = [stack_team]
+    teams_to_stack = [stack_team] if stack_team and stack_team != "None" else \
+    df[~df['POS'].str.contains('P')].groupby('Team')['Solver_Proj'].mean().sort_values(ascending=False).head(
+        8).index.tolist()
 
     for i in range(num_lineups):
-        best_lineup_for_pass, highest_score = None, -1
+        best_lineup = None
+        highest_score = -1
         for current_team in teams_to_stack:
-            prob = pulp.LpProblem(f"MLB_{i}_{current_team}", pulp.LpMaximize)
-            players, slots = df.index.tolist(), list(POS_ORDER.keys())
-            x = pulp.LpVariable.dicts("x", (players, slots), cat="Binary")
+            try:
+                prob = pulp.LpProblem(f"MLB_{i}_{current_team}", pulp.LpMaximize)
+                players, slots = df.index.tolist(), list(POS_ORDER.keys())
+                x = pulp.LpVariable.dicts("x", (players, slots), cat="Binary")
+                prob += pulp.lpSum([df.loc[p, 'Solver_Proj'] * x[p][s] for p in players for s in slots])
+                prob += pulp.lpSum([df.loc[p, 'Salary'] * x[p][s] for p in players for s in slots]) <= 50000
+                for s in slots: prob += pulp.lpSum([x[p][s] for p in players]) == 1
+                for p in players:
+                    prob += pulp.lpSum([x[p][s] for s in slots]) <= 1
+                    if player_usage[p] >= max_count:
+                        prob += pulp.lpSum([x[p][s] for s in slots]) == 0
+                    elif df.loc[p, 'Player'] in locks:
+                        prob += pulp.lpSum([x[p][s] for s in slots]) == 1
+                    pos = str(df.loc[p, 'POS'])
+                    for s in slots:
+                        if (s.startswith('P') and 'P' not in pos) or (s == 'C' and 'C' not in pos) or \
+                                (s == '1B' and '1B' not in pos) or (s == '2B' and '2B' not in pos) or \
+                                (s == '3B' and '3B' not in pos) or (s == 'SS' and 'SS' not in pos) or \
+                                (s.startswith('OF') and 'OF' not in pos): prob += x[p][s] == 0
+                for past in used_player_indices: prob += pulp.lpSum([x[p][s] for p in past for s in slots]) <= (
+                            len(slots) - diversity)
+                h_idx = df[(df['Team'] == current_team) & (~df['POS'].str.contains('P'))].index.tolist()
+                if len(h_idx) >= int(min_stack):
+                    prob += pulp.lpSum([x[p][s] for p in h_idx for s in slots]) >= int(min_stack)
+                else:
+                    continue
 
-            prob += pulp.lpSum([df.loc[p, 'Solver_Proj'] * x[p][s] for p in players for s in slots])
-            prob += pulp.lpSum([df.loc[p, 'Salary'] * x[p][s] for p in players for s in slots]) <= 50000
-            for s in slots: prob += pulp.lpSum([x[p][s] for p in players]) == 1
-            for p in players: prob += pulp.lpSum([x[p][s] for s in slots]) <= 1
-            for p in players:
-                if player_usage[p] >= max_count:
-                    prob += pulp.lpSum([x[p][s] for s in slots]) == 0
-                elif df.loc[p, 'Player'] in locks:
-                    prob += pulp.lpSum([x[p][s] for s in slots]) == 1
-            for p in players:
-                pos = str(df.loc[p, 'POS'])
-                for s in slots:
-                    if (s.startswith('P') and 'P' not in pos) or (s == 'C' and 'C' not in pos) or \
-                            (s == '1B' and '1B' not in pos) or (s == '2B' and '2B' not in pos) or \
-                            (s == '3B' and '3B' not in pos) or (s == 'SS' and 'SS' not in pos) or \
-                            (s.startswith('OF') and 'OF' not in pos): prob += x[p][s] == 0
-            for past_indices in used_player_indices:
-                prob += pulp.lpSum([x[p][s] for p in past_indices for s in slots]) <= (len(slots) - diversity)
-
-            h_idx = df[(df['Team'] == current_team) & (~df['POS'].str.contains('P', na=False))].index.tolist()
-            if len(h_idx) >= int(min_stack):
-                prob += pulp.lpSum([x[p][s] for p in h_idx for s in slots]) >= int(min_stack)
-            else:
-                continue
-
-            prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=2))
-            if pulp.LpStatus[prob.status] in ['Optimal', 'Feasible']:
-                score = pulp.value(prob.objective)
-                if score > highest_score:
-                    highest_score = score
-                    lineup_data, p_indices, t_sal, t_proj = [], [], 0, 0
+                prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=1))
+                if pulp.LpStatus[prob.status] in ['Optimal', 'Feasible'] and pulp.value(prob.objective) > highest_score:
+                    highest_score = pulp.value(prob.objective)
+                    l_players, p_idx, t_sal, t_proj = [], [], 0, 0
                     for p in players:
                         for s in slots:
                             if x[p][s].varValue == 1:
-                                row = df.loc[p];
-                                b_h, o_h = row['CleanHand'], p_hand_map.get(row['Opponent'], '?')
-                                lineup_data.append(
+                                row = df.loc[p]
+                                o_h = p_hand_map.get(row['Opponent'], '?')
+                                l_players.append(
                                     {'Slot': s, 'Name': row['Player'], 'Team': row['Team'], 'Hand': row['Hand'],
-                                     'OppP': "—" if s.startswith('P') else o_h, 'Adv': False if s.startswith('P') else (
-                                                b_h == 'S' or (b_h == 'L' and o_h == 'R') or (
-                                                    b_h == 'R' and o_h == 'L')), 'Proj': round(row['Solver_Proj'], 2),
-                                     'Salary': row['Salary'], 'SortKey': POS_ORDER[s]})
-                                p_indices.append(p);
+                                     'Logo': get_logo_url(row['Team']), 'OppP': "—" if 'P' in s else o_h,
+                                     'Adv': False if 'P' in s else (row['CleanHand'] == 'S' or (
+                                                 row['CleanHand'] == 'L' and o_h == 'R') or (row[
+                                                                                                 'CleanHand'] == 'R' and o_h == 'L')),
+                                     'Proj': round(row['Solver_Proj'], 2), 'Salary': row['Salary'],
+                                     'SortKey': POS_ORDER[s]})
+                                p_idx.append(p);
                                 t_sal += row['Salary'];
                                 t_proj += row['Solver_Proj']
-                    lineup_data.sort(key=lambda x: x['SortKey'])
-                    best_lineup_for_pass = {'players': lineup_data, 'total_salary': t_sal,
-                                            'total_projection': round(t_proj, 2), 'indices': p_indices}
+                    l_players.sort(key=lambda x: x['SortKey'])
+                    best_lineup = {'players': l_players, 'total_salary': t_sal, 'total_projection': round(t_proj, 2),
+                                   'indices': p_idx}
+            except:
+                continue
 
-        if best_lineup_for_pass:
-            all_results.append(best_lineup_for_pass);
-            used_player_indices.append(best_lineup_for_pass['indices'])
-            for idx in best_lineup_for_pass['indices']: player_usage[idx] += 1
+        if best_lineup:
+            all_results.append(best_lineup);
+            used_player_indices.append(best_lineup['indices'])
+            for idx in best_lineup['indices']: player_usage[idx] += 1
         else:
             break
     return all_results
@@ -225,44 +219,46 @@ def index():
     df_raw = pd.read_csv(SALARY_CSV)
     confirmed_teams = set()
     order_col = next((c for c in df_raw.columns if 'order' in c.lower()), None)
-    if order_col:
-        orders = pd.to_numeric(df_raw[order_col], errors='coerce')
-        confirmed_teams = set(df_raw[orders.between(1, 9)]['Team'].unique())
+    if order_col: confirmed_teams = set(
+        df_raw[pd.to_numeric(df_raw[order_col], errors='coerce').between(1, 9)]['Team'].unique())
 
     df_raw['norm_name'] = df_raw['Player'].apply(normalize_name)
     df_raw['CleanHand'] = df_raw['Hand'].apply(clean_hand_str)
     df_raw['Salary'] = pd.to_numeric(df_raw['Salary'].astype(str).replace(r'[\$,]', '', regex=True).apply(
-        lambda x: float(x.replace('k', '')) * 1000 if 'k' in x.lower() else x), errors='coerce').fillna(0)
+        lambda x: float(x.replace('k', '')) * 1000 if 'k' in str(x).lower() else x), errors='coerce').fillna(0)
     df_raw['Proj'] = pd.to_numeric(df_raw['Projected Points'], errors='coerce').fillna(0)
-
     if not h_fg.empty: df_raw = df_raw.merge(h_fg, on='norm_name', how='left').fillna(0)
     if not p_fg.empty: df_raw = df_raw.merge(p_fg, on='norm_name', how='left').fillna(0)
 
-    pitchers_df = df_raw[df_raw['POS'].str.contains('P', na=False)]
-    p_hand_map = pitchers_df.set_index('Team')['CleanHand'].to_dict()
-
+    p_hand_map = df_raw[df_raw['POS'].str.contains('P', na=False)].set_index('Team')['CleanHand'].to_dict()
     pool_list, unique_game_map = [], {}
     for _, r in df_raw.iterrows():
         p_data = r.to_dict()
-        b_clean, o_clean = r['CleanHand'], p_hand_map.get(r['Opponent'], '?')
-        p_data['OppP'] = "—" if 'P' in str(r['POS']) else o_clean
+        p_data['Logo'] = get_logo_url(r['Team'])
+        o_h = p_hand_map.get(r['Opponent'], '?')
+        p_data['OppP'] = "—" if 'P' in str(r['POS']) else o_h
         p_data['Adv'] = False if 'P' in str(r['POS']) else (
-                    b_clean == 'S' or (b_clean == 'L' and o_clean == 'R') or (b_clean == 'R' and o_clean == 'L'))
+                    r['CleanHand'] == 'S' or (r['CleanHand'] == 'L' and o_h == 'R') or (
+                        r['CleanHand'] == 'R' and o_h == 'L'))
         pool_list.append(p_data)
-        t1, t2 = str(r['Team']), str(r['Opponent'])
-        g_id = " vs ".join(sorted([TEAM_MAP.get(t1, t1), TEAM_MAP.get(t2, t2)]))
-        if g_id not in unique_game_map: unique_game_map[g_id] = {'t1': t1, 't2': t2}
+        g_id = " vs ".join(sorted(
+            [TEAM_MAP.get(str(r['Team']), str(r['Team'])), TEAM_MAP.get(str(r['Opponent']), str(r['Opponent']))]))
+        if g_id not in unique_game_map: unique_game_map[g_id] = {'t1': r['Team'], 't2': r['Opponent']}
 
     available_games = []
-    for g_id, teams in sorted(unique_game_map.items()):
-        time_str = espn_times.get(g_id, "TBD")
-        t1_icon = '<span style="color:#00ff41;">✔</span>' if teams[
-                                                                 't1'] in confirmed_teams else '<span style="color:#ff4b4b;">✘</span>'
-        t2_icon = '<span style="color:#00ff41;">✔</span>' if teams[
-                                                                 't2'] in confirmed_teams else '<span style="color:#ff4b4b;">✘</span>'
-        available_games.append({"id": g_id, "display": f"{g_id} ({time_str})", "indicator": f"{t1_icon}{t2_icon}"})
+    for g_id, teams in unique_game_map.items():
+        time_data = espn_times.get(g_id, {'display': 'TBD', 'raw': datetime.max.replace(tzinfo=pytz.utc)})
+        available_games.append({
+            "id": g_id, "display": g_id, "time": time_data['display'], "sort_time": time_data['raw'],
+            "t1": teams['t1'], "t2": teams['t2'], "l1": get_logo_url(teams['t1']), "l2": get_logo_url(teams['t2']),
+            "i1": '<span class="status-dot on"></span>' if teams[
+                                                               't1'] in confirmed_teams else '<span class="status-dot off"></span>',
+            "i2": '<span class="status-dot on"></span>' if teams[
+                                                               't2'] in confirmed_teams else '<span class="status-dot off"></span>'
+        })
+    available_games.sort(key=lambda x: x['sort_time'])
 
-    results, status = None, "Ready."
+    results, status = None, "SYSTEMS LIVE"
     if request.method == 'POST':
         results = run_optimizer(df_raw, num_lineups=int(request.form.get('num_lineups', 5)),
                                 locks=request.form.getlist('player_locks'), stack_team=request.form.get('stack_team'),
@@ -271,8 +267,7 @@ def index():
                                 exposure_limit=float(request.form.get('exposure_limit', 1.0)),
                                 excluded_games=[g['id'] for g in available_games if
                                                 g['id'] not in request.form.getlist('games')])
-        status = f"Generated {len(results)} lineups."
-
+        status = f"LOCKED {len(results)} LINEUPS"
     return render_template_string(HTML_BODY, results=results, status=status,
                                   teams=sorted(df_raw['Team'].dropna().unique()), games=available_games, pool=pool_list)
 
@@ -281,135 +276,181 @@ HTML_BODY = """
 <!DOCTYPE html>
 <html>
 <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
-        :root { --bg: #0d1117; --card: #161b22; --border: #30363d; --accent: #00ff41; --text: #c9d1d9; --muted: #8b949e; --edge: #f1e05a; --chalk: #58a6ff; }
-        body { background: var(--bg); color: var(--text); font-family: -apple-system, sans-serif; padding: 20px; line-height: 1.5; }
-        .container { max-width: 1200px; margin: auto; }
-        .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 20px; margin-bottom: 20px; }
-        .status-bar { background: var(--card); border-left: 4px solid var(--accent); padding: 10px 20px; font-family: monospace; font-size: 0.9em; margin-bottom: 20px; }
-        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-        .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 20px; }
-        input, select, button { background: var(--bg); color: var(--text); border: 1px solid var(--border); padding: 8px; border-radius: 6px; }
-        button { background: #238636; border: none; font-weight: bold; cursor: pointer; color: white; }
-        table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.82em; table-layout: fixed; }
-        th { text-align: left; color: var(--muted); padding: 12px 8px; border-bottom: 1px solid var(--border); cursor: pointer; }
-        th:hover { color: var(--accent); background: #21262d; }
-        td { padding: 10px 8px; border-bottom: 1px solid #21262d; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .sticky-head { position: sticky; top: 0; background: var(--card); z-index: 10; }
-        .hand-adv { background: #238636; color: white; padding: 2px 6px; border-radius: 4px; font-weight: bold; }
-        .hand-neut { background: #30363d; color: #c9d1d9; padding: 2px 6px; border-radius: 4px; font-size: 0.85em; }
-        .edge-col { color: var(--edge); font-weight: bold; }
-        .chalk-col { color: var(--chalk); font-weight: bold; }
+        :root { 
+            --bg: #0d1117; 
+            --card: #161b22; 
+            --border: #30363d; 
+            --accent: #3fb950;
+            --text: #c9d1d9;
+            --header: #161b22; 
+            --win: #238636; 
+            --loss: #da3633; 
+            --h-edge: #e3b341;
+            --p-edge: #58a6ff; 
+            --row-alt: #1c2128;
+            --logo-bg: rgba(255, 255, 255, 0.12);
+        }
+
+        body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; padding: 10px; margin: 0; line-height: 1.5; }
+        .container { max-width: 1400px; margin: auto; }
+
+        .top-nav { background: var(--header); padding: 12px 15px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; border: 1px solid var(--border); margin-bottom: 15px; position: sticky; top: 0; z-index: 100; }
+        .status-pill { background: #000; border: 1px solid var(--accent); color: var(--accent); padding: 4px 10px; border-radius: 20px; font-weight: 800; font-size: 0.7em; letter-spacing: 0.5px; }
+
+        /* Layout Shift for Mobile */
+        .grid-layout { display: flex; flex-direction: column; gap: 15px; }
+
+        @media (min-width: 992px) {
+            .grid-layout { display: grid; grid-template-columns: 320px 1fr; gap: 20px; align-items: start; }
+            body { padding: 20px; }
+        }
+
+        .sidebar { display: flex; flex-direction: column; gap: 15px; }
+        .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 15px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+        .card h3 { margin-top: 0; border-bottom: 1px solid var(--border); padding-bottom: 10px; font-size: 0.85em; text-transform: uppercase; color: #f0f6fc; letter-spacing: 0.5px; }
+
+        /* Readability & Mobile Table Scrolling */
+        .table-responsive { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: 6px; }
+        table { width: 100%; border-collapse: collapse; font-size: 0.85em; white-space: nowrap; }
+        th { text-align: left; background: var(--header); padding: 12px 10px; color: #8b949e; text-transform: uppercase; font-size: 0.65em; border-bottom: 2px solid var(--border); }
+
+        tbody tr:nth-child(even) { background-color: var(--row-alt); }
+        td { padding: 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+
+        .stat-val { font-family: 'Roboto Mono', monospace; font-weight: 500; font-size: 1em; }
+        .player-name { color: #f0f6fc; font-weight: 600; white-space: normal; min-width: 120px; }
+
+        .team-logo-icon { width: 24px; height: 24px; vertical-align: middle; margin-right: 8px; background: var(--logo-bg); border-radius: 4px; padding: 2px; }
+        .slate-logo { width: 20px; height: 20px; vertical-align: middle; background: var(--logo-bg); border-radius: 4px; padding: 2px; margin: 0 4px; }
+
+        .game-card { background: var(--row-alt); border: 1px solid var(--border); border-radius: 6px; padding: 10px; margin-bottom: 8px; }
+        .status-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin: 0 4px; }
+        .status-dot.on { background: var(--accent); }
+        .status-dot.off { background: #484f58; }
+
+        button.lock-btn { background: var(--win); color: white; border: none; font-weight: 700; cursor: pointer; padding: 14px; border-radius: 6px; width: 100%; font-size: 0.9em; }
+
+        input, select { background: #0d1117; color: #fff; border: 1px solid var(--border); padding: 10px; border-radius: 6px; font-size: 16px; /* Prevents iOS zoom on focus */ }
+        .hand-tag { padding: 2px 6px; border-radius: 3px; font-weight: 700; font-size: 0.7em; }
+        .adv-match { background: var(--win); color: #fff; }
+        .neut-match { background: #30363d; color: #8b949e; }
+
+        .pool-scroll { max-height: 60vh; overflow-y: auto; }
+
+        /* Lineup Cards Grid */
+        .lineup-grid { display: grid; grid-template-columns: 1fr; gap: 15px; margin-top: 25px; }
+        @media (min-width: 768px) { .lineup-grid { grid-template-columns: repeat(2, 1fr); } }
+        @media (min-width: 1200px) { .lineup-grid { grid-template-columns: repeat(3, 1fr); } }
     </style>
 </head>
 <body>
 <div class="container">
-    <div class="header"><h1 style="color: var(--accent); margin:0;">BETIFY MLB PRO + SHEET SYNC</h1></div>
-    <div class="status-bar">SALARY-CHALK MODE ACTIVE | {{ status }}</div>
+    <div class="top-nav">
+        <h2 style="margin:0; font-size: 1.1em; color:#f0f6fc;">BETIFY <span style="color:var(--accent)">PRO</span></h2>
+        <div class="status-pill">{{ status }}</div>
+    </div>
+
     <form method="post">
-        <div class="grid">
+    <div class="grid-layout">
+        <div class="sidebar">
             <div class="card">
-                <h3>Settings</h3>
-                <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
-                    <div>Lineups: <input type="number" name="num_lineups" value="10" style="width:100%;"></div>
-                    <div>Diversity: <input type="number" name="diversity" value="4" style="width:100%;"></div>
-                    <div>Max Exposure: 
-                        <select name="exposure_limit" style="width:100%;">
-                            <option value="1.0">100%</option><option value="0.5">50%</option>
-                            <option value="0.33">33%</option><option value="0.25">25%</option>
-                        </select>
-                    </div>
-                    <div>Stack: <select name="stack_team" style="width:100%;"><option value="None">Auto</option>{% for t in teams %}<option value="{{ t }}">{{ t }}</option>{% endfor %}</select></div>
-                    <div>Min Stack: <input type="number" name="min_stack" value="3" min="0" max="5" style="width:100%;"></div>
+                <h3>Draft Config</h3>
+                <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:12px;">
+                    <div><small style="font-size:0.6em; color:#8b949e">LINEUPS</small><input type="number" name="num_lineups" value="10" style="width:90%"></div>
+                    <div><small style="font-size:0.6em; color:#8b949e">DIVERSITY</small><input type="number" name="diversity" value="4" style="width:90%"></div>
+                    <div><small style="font-size:0.6em; color:#8b949e">MIN STACK</small><input type="number" name="min_stack" value="3" style="width:90%"></div>
+                    <div><small style="font-size:0.6em; color:#8b949e">EXPOSURE</small><select name="exposure_limit" style="width:100%"><option value="1.0">100%</option><option value="0.5">50%</option></select></div>
                 </div>
-                <br><button type="submit" style="width:100%; padding:12px;">GENERATE LINEUPS</button>
+                <small style="font-size:0.6em; color:#8b949e">STACK TEAM</small>
+                <select name="stack_team" style="margin-bottom:15px; width:100%"><option value="None">AUTO SELECT</option>{% for t in teams %}<option value="{{ t }}">{{ t }}</option>{% endfor %}</select>
+                <button type="submit" class="lock-btn">LOCK LINEUPS</button>
             </div>
+
             <div class="card">
-                <h3>Slate (Verified)</h3>
-                <div style="max-height:150px; overflow-y:auto; font-size:0.85em;">
-                    {% for game in games %}<div style="display:flex; justify-content:space-between; margin-bottom:8px;">
-                        <span><input type="checkbox" name="games" value="{{ game.id }}" checked> {{ game.display }}</span>
-                        <b>{{ game.indicator|safe }}</b>
-                    </div>{% endfor %}
+                <h3>Game Slate</h3>
+                <div style="max-height:220px; overflow-y:auto;">
+                    {% for g in games %}
+                    <div class="game-card">
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                            <span style="font-size:0.7em; color:var(--accent); font-family:monospace;">{{ g.time }} ET</span>
+                            <input type="checkbox" name="games" value="{{ g.id }}" checked style="width:18px; height:18px;">
+                        </div>
+                        <div style="display:flex; align-items:center; justify-content:space-between; font-size:0.9em;">
+                            <span><img src="{{ g.l1 }}" class="slate-logo">{{ g.i1|safe }}<b style="color:#f0f6fc">{{ g.t1 }}</b></span>
+                            <span style="color:var(--border);">vs</span>
+                            <span><b style="color:#f0f6fc">{{ g.t2 }}</b>{{ g.i2|safe }}<img src="{{ g.l2 }}" class="slate-logo"></span>
+                        </div>
+                    </div>
+                    {% endfor %}
                 </div>
             </div>
         </div>
 
         <div class="card">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
-                <h3 style="margin:0;">Player Pool</h3>
-                <input type="text" id="playerSearch" placeholder="Filter players..." style="max-width:200px;">
+            <div style="display:flex; flex-direction:column; gap:10px; margin-bottom:15px;">
+                <h3 style="margin:0; border:none;">Player Pool</h3>
+                <input type="text" id="pSearch" placeholder="Filter by name, team, or position..." style="width:100%; box-sizing:border-box;">
             </div>
-            <div style="max-height:500px; overflow-y:auto; border:1px solid var(--border); border-radius:6px;">
-                <table>
-                    <thead>
-                        <tr class="sticky-head">
-                            <th>LCK</th><th>PLAYER</th><th>POS</th><th>TEAM</th><th>BATS</th>
-                            <th onclick="sortTable(5, true)">KBB/BRL</th>
-                            <th onclick="sortTable(6, true)">SIERA/wOBA</th>
-                            <th onclick="sortTable(7, true)">SUBSTANCE</th>
-                            <th onclick="sortTable(8, true)">SALARY</th>
-                            <th onclick="sortTable(9, true)">PROJ</th>
-                        </tr>
-                    </thead>
-                    <tbody id="playerBody">
-                        {% for p in pool %}<tr>
-                            <td><input type="checkbox" name="player_locks" value="{{ p.Player }}"></td>
-                            <td><b>{{ p.Player }}</b></td><td>{{ p.POS }}</td><td>{{ p.Team }}</td>
-                            <td><span class="{{ 'hand-adv' if p.Adv else 'hand-neut' }}">{{ p.Hand }}</span></td>
-                            <td class="{{ 'chalk-col' if 'P' in p.POS else 'edge-col' }}">
-                                {{ (p['K-BB%']*100)|round(1) if 'P' in p.POS else (p['Barrel%']*100)|round(1) }}%
-                            </td>
-                            <td class="{{ 'chalk-col' if 'P' in p.POS else 'edge-col' }}">
-                                {{ p.SIERA|round(2) if 'P' in p.POS else p.xwOBA|round(3) }}
-                            </td>
-                            <td style="font-weight:bold;">{{ p.Chalk_Quality|round(1) if 'P' in p.POS else p.Edge_Value|round(1) }}</td>
-                            <td>${{ "{:,.0f}".format(p.Salary) }}</td>
-                            <td style="color:var(--accent); font-weight:bold;">{{ p.Proj|round(1) }}</td>
-                        </tr>{% endfor %}
-                    </tbody>
-                </table>
+
+            <div class="pool-scroll">
+                <div class="table-responsive">
+                    <table>
+                        <thead><tr><th>LCK</th><th>PLAYER</th><th>POS</th><th>TEAM</th><th>BATS</th><th>%</th><th>RAW</th><th>PWR</th><th>SAL</th><th>PRJ</th></tr></thead>
+                        <tbody id="pBody">
+                            {% for p in pool %}
+                            <tr>
+                                <td><input type="checkbox" name="player_locks" value="{{ p.Player }}" style="width:18px; height:18px;"></td>
+                                <td><img src="{{ p.Logo }}" class="team-logo-icon"><span class="player-name">{{ p.Player }}</span></td>
+                                <td style="color:var(--accent); font-weight:bold;">{{ p.POS }}</td>
+                                <td style="color:#8b949e">{{ p.Team }}</td>
+                                <td><span class="hand-tag {{ 'adv-match' if p.Adv else 'neut-match' }}">{{ p.Hand }}</span></td>
+                                <td class="stat-val" style="color:{{ 'var(--p-edge)' if 'P' in p.POS else 'var(--h-edge)' }}">{{ (p['K-BB%']*100)|round(0) if 'P' in p.POS else (p['Barrel%']*100)|round(0) }}%</td>
+                                <td class="stat-val">{{ p.SIERA|round(2) if 'P' in p.POS else p.xwOBA|round(3) }}</td>
+                                <td class="stat-val" style="color:var(--accent)">{{ p.Chalk_Quality|round(0) if 'P' in p.POS else p.Edge_Value|round(0) }}</td>
+                                <td class="stat-val" style="color:#f0f6fc">${{ "{:,.0f}".format(p.Salary) }}</td>
+                                <td class="stat-val" style="color:#f0f6fc; font-weight:700;">{{ p.Proj|round(1) }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
             </div>
         </div>
+    </div>
     </form>
 
-    {% if results %}{% for lineup in results %}<div class="card">
-        <div style="display:flex; justify-content:space-between; border-bottom:1px solid var(--border); padding-bottom:10px; margin-bottom:10px;">
-            <b>Lineup #{{ loop.index }}</b>
-            <span style="color:var(--accent); font-weight:bold;">SAL: ${{ "{:,.0f}".format(lineup.total_salary) }} | PROJ: {{ lineup.total_projection }}</span>
+    {% if results %}
+    <div class="lineup-grid">
+        {% for lineup in results %}
+        <div class="card" style="border-top: 3px solid var(--accent); padding: 12px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                <b style="color:#f0f6fc; font-size:0.8em;">LINEUP #{{ loop.index }}</b>
+                <span class="stat-val" style="color:var(--accent); font-size:0.9em;">{{ lineup.total_projection }} <small style="color:#8b949e">PTS</small></span>
+            </div>
+            <table style="font-size:0.8em;">
+                {% for p in lineup.players %}
+                <tr style="border-bottom: 1px solid rgba(255,255,255,0.03);">
+                    <td style="color:var(--accent); font-weight:bold; width:25px;">{{p.Slot}}</td>
+                    <td><img src="{{p.Logo}}" class="team-logo-icon" style="width:20px; height:20px;"><span class="player-name" style="font-size:0.9em;">{{p.Name}}</span></td>
+                    <td class="stat-val" style="text-align:right; color:#8b949e">${{ "{:,.0f}".format(p.Salary) }}</td>
+                </tr>
+                {% endfor %}
+            </table>
         </div>
-        <table>
-            <tr><th>POS</th><th>PLAYER</th><th>TEAM</th><th>BATS</th><th>VS P</th><th>SAL</th><th>PROJ</th></tr>
-            {% for p in lineup.players %}<tr>
-                <td style="color:var(--muted);">{{p.Slot}}</td>
-                <td><b>{{p.Name}}</b></td><td>{{p.Team}}</td>
-                <td><span class="{{ 'hand-adv' if p.Adv else 'hand-neut' }}">{{p.Hand}}</span></td>
-                <td>{{p.OppP}}</td><td>${{ "{:,.0f}".format(p.Salary) }}</td><td style="color:var(--accent);">{{p.Proj}}</td>
-            </tr>{% endfor %}
-        </table>
-    </div>{% endfor %}{% endif %}
+        {% endfor %}
+    </div>
+    {% endif %}
 </div>
 
 <script>
-function sortTable(colIdx, isNum = false) {
-    const tbody = document.getElementById("playerBody");
-    const rows = Array.from(tbody.querySelectorAll("tr"));
-    const sorted = rows.sort((a, b) => {
-        let x = a.children[colIdx].innerText, y = b.children[colIdx].innerText;
-        if (isNum) { 
-            x = parseFloat(x.replace(/[^0-9.-]+/g, "")) || 0; 
-            y = parseFloat(y.replace(/[^0-9.-]+/g, "")) || 0; 
-        }
-        return y - x;
+    document.getElementById('pSearch').addEventListener('input', function() {
+        let q = this.value.toLowerCase();
+        document.querySelectorAll('#pBody tr').forEach(r => {
+            r.style.display = r.innerText.toLowerCase().includes(q) ? '' : 'none';
+        });
     });
-    tbody.innerHTML = ""; sorted.forEach(row => tbody.appendChild(row));
-}
-document.getElementById('playerSearch').addEventListener('input', function() {
-    let q = this.value.toLowerCase();
-    document.querySelectorAll('#playerBody tr').forEach(r => { 
-        r.style.display = r.innerText.toLowerCase().includes(q) ? '' : 'none'; 
-    });
-});
 </script>
 </body>
 </html>
