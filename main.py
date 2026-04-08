@@ -37,10 +37,12 @@ TEAM_ID_MAP = {
     "SEA": 136, "STL": 138, "TB": 139, "TEX": 140, "TOR": 141, "WAS": 120
 }
 
+
 def get_logo_url(team_abbr):
     clean_abbr = TEAM_MAP.get(team_abbr, team_abbr)
     tid = TEAM_ID_MAP.get(clean_abbr)
     return f"https://www.mlbstatic.com/team-logos/team-cap-on-light/{tid}.svg" if tid else "https://www.mlbstatic.com/team-logos/league/1.svg"
+
 
 def normalize_name(name):
     if not isinstance(name, str): return ""
@@ -50,10 +52,12 @@ def normalize_name(name):
         if name.endswith(s): name = name[:-len(s)]
     return name.strip()
 
+
 def clean_hand_str(h):
     if pd.isna(h): return "?"
     s = str(h).upper()
     return s[0] if s and s[0] in 'RLS' else "?"
+
 
 def get_espn_game_times():
     now_et = datetime.now(pytz.timezone('US/Eastern'))
@@ -65,13 +69,16 @@ def get_espn_game_times():
         for event in data.get('events', []):
             competitions = event.get('competitions', [{}])[0]
             competitors = competitions.get('competitors', [])
-            raw_names = [TEAM_MAP.get(t['team']['abbreviation'].upper(), t['team']['abbreviation'].upper()) for t in competitors]
+            raw_names = [TEAM_MAP.get(t['team']['abbreviation'].upper(), t['team']['abbreviation'].upper()) for t in
+                         competitors]
             game_id = " vs ".join(sorted(raw_names))
             utc_time = datetime.strptime(event['date'], "%Y-%m-%dT%H:%MZ").replace(tzinfo=pytz.utc)
             et_dt = utc_time.astimezone(pytz.timezone('US/Eastern'))
             slate_times[game_id] = {'display': et_dt.strftime('%I:%M %p'), 'raw': et_dt}
-    except: pass
+    except:
+        pass
     return slate_times
+
 
 def get_weighted_stats():
     global _STATS_CACHE
@@ -80,32 +87,49 @@ def get_weighted_stats():
     try:
         h26, h25 = batting_stats(2026), batting_stats(2025)
         h_merge = pd.merge(h26, h25, on='Name', how='outer', suffixes=('_26', '_25')).fillna(0)
+
+        # Ensure columns exist before weight calc
+        for col in ['Barrel%_26', 'Barrel%_25', 'xwOBA_26', 'xwOBA_25']:
+            if col not in h_merge.columns: h_merge[col] = 0
+
         h_merge['W_Barrel'] = (h_merge['Barrel%_26'] * 0.7) + (h_merge['Barrel%_25'] * 0.3)
         h_merge['W_xwOBA'] = (h_merge['xwOBA_26'] * 0.7) + (h_merge['xwOBA_25'] * 0.3)
         h_merge['Edge_Value'] = (h_merge['W_Barrel'] * 50) + (h_merge['W_xwOBA'] * 20)
         h_merge['norm_name'] = h_merge['Name'].apply(normalize_name)
-        h_final = h_merge[['norm_name', 'Edge_Value', 'W_Barrel', 'W_xwOBA']].rename(columns={'W_Barrel': 'Barrel%', 'W_xwOBA': 'xwOBA'})
+        h_final = h_merge[['norm_name', 'Edge_Value', 'W_Barrel', 'W_xwOBA']].rename(
+            columns={'W_Barrel': 'Barrel%', 'W_xwOBA': 'xwOBA'})
 
         raw_barrels = statcast_pitcher_exitvelo_barrels(2025)
         if 'last_name, first_name' in raw_barrels.columns:
-            raw_barrels['Name'] = raw_barrels['last_name, first_name'].apply(lambda x: ' '.join(reversed(x.split(', '))) if isinstance(x, str) else x)
-        p_barrels = raw_barrels[['Name', 'brl_percent']].rename(columns={'brl_percent': 'Pitcher_Brl%'})
+            raw_barrels['Name'] = raw_barrels['last_name, first_name'].apply(
+                lambda x: ' '.join(reversed(x.split(', '))) if isinstance(x, str) else x)
+        p_barrels = raw_barrels[['Name', 'brl_percent']].rename(
+            columns={'brl_percent': 'Pitcher_Brl%'}) if not raw_barrels.empty else pd.DataFrame(
+            columns=['Name', 'Pitcher_Brl%'])
 
         p26, p25 = pitching_stats(2026), pitching_stats(2025)
         p_merge = pd.merge(p26, p25, on='Name', how='outer', suffixes=('_26', '_25')).fillna(0)
+
+        # Ensure columns exist before weight calc
+        for col in ['SIERA_26', 'SIERA_25', 'K-BB%_26', 'K-BB%_25']:
+            if col not in p_merge.columns: p_merge[col] = 0
+
         p_merge['W_SIERA'] = (p_merge['SIERA_26'] * 0.7) + (p_merge['SIERA_25'] * 0.3)
         p_merge['W_KBB'] = (p_merge['K-BB%_26'] * 0.7) + (p_merge['K-BB%_25'] * 0.3)
         p_combined = pd.merge(p_merge, p_barrels, on='Name', how='left').fillna(0)
         p_combined['Chalk_Quality'] = (p_combined['W_KBB'] * 120) + (15 / p_combined['W_SIERA'].replace(0, 5))
         p_combined['norm_name'] = p_combined['Name'].apply(normalize_name)
-        p_final = p_combined[['norm_name', 'Chalk_Quality', 'W_SIERA', 'W_KBB', 'Pitcher_Brl%']].rename(columns={'W_SIERA': 'SIERA', 'W_KBB': 'K-BB%'})
+        p_final = p_combined[['norm_name', 'Chalk_Quality', 'W_SIERA', 'W_KBB', 'Pitcher_Brl%']].rename(
+            columns={'W_SIERA': 'SIERA', 'W_KBB': 'K-BB%'})
 
         _STATS_CACHE['h'], _STATS_CACHE['p'], _STATS_CACHE['time'] = h_final, p_final, time.time()
         return h_final, p_final
     except:
         return pd.DataFrame(), pd.DataFrame()
 
-def run_optimizer(df_input, num_lineups=1, locks=[], stack_team=None, min_stack=3, diversity=4, excluded_games=[], exposure_limit=1.0):
+
+def run_optimizer(df_input, num_lineups=1, locks=[], stack_team=None, min_stack=3, diversity=4, excluded_games=[],
+                  exposure_limit=1.0):
     df = df_input.copy()
     all_results, used_player_indices = [], []
     player_usage = {p: 0 for p in df.index}
@@ -131,7 +155,9 @@ def run_optimizer(df_input, num_lineups=1, locks=[], stack_team=None, min_stack=
         return proj * random.uniform(0.96, 1.04)
 
     df['Solver_Proj'] = df.apply(apply_logic, axis=1)
-    teams_to_stack = [stack_team] if stack_team and stack_team != "None" else df[~df['POS'].str.contains('P')].groupby('Team')['Solver_Proj'].mean().sort_values(ascending=False).head(8).index.tolist()
+    teams_to_stack = [stack_team] if stack_team and stack_team != "None" else \
+    df[~df['POS'].str.contains('P')].groupby('Team')['Solver_Proj'].mean().sort_values(ascending=False).head(
+        8).index.tolist()
 
     for i in range(num_lineups):
         best_lineup = None
@@ -146,15 +172,23 @@ def run_optimizer(df_input, num_lineups=1, locks=[], stack_team=None, min_stack=
                 for s in slots: prob += pulp.lpSum([x[p][s] for p in players]) == 1
                 for p in players:
                     prob += pulp.lpSum([x[p][s] for s in slots]) <= 1
-                    if player_usage[p] >= max_count: prob += pulp.lpSum([x[p][s] for s in slots]) == 0
-                    elif df.loc[p, 'Player'] in locks: prob += pulp.lpSum([x[p][s] for s in slots]) == 1
+                    if player_usage[p] >= max_count:
+                        prob += pulp.lpSum([x[p][s] for s in slots]) == 0
+                    elif df.loc[p, 'Player'] in locks:
+                        prob += pulp.lpSum([x[p][s] for s in slots]) == 1
                     pos = str(df.loc[p, 'POS'])
                     for s in slots:
-                        if (s.startswith('P') and 'P' not in pos) or (s == 'C' and 'C' not in pos) or (s == '1B' and '1B' not in pos) or (s == '2B' and '2B' not in pos) or (s == '3B' and '3B' not in pos) or (s == 'SS' and 'SS' not in pos) or (s.startswith('OF') and 'OF' not in pos): prob += x[p][s] == 0
-                for past in used_player_indices: prob += pulp.lpSum([x[p][s] for p in past for s in slots]) <= (len(slots) - diversity)
+                        if (s.startswith('P') and 'P' not in pos) or (s == 'C' and 'C' not in pos) or (
+                                s == '1B' and '1B' not in pos) or (s == '2B' and '2B' not in pos) or (
+                                s == '3B' and '3B' not in pos) or (s == 'SS' and 'SS' not in pos) or (
+                                s.startswith('OF') and 'OF' not in pos): prob += x[p][s] == 0
+                for past in used_player_indices: prob += pulp.lpSum([x[p][s] for p in past for s in slots]) <= (
+                            len(slots) - diversity)
                 h_idx = df[(df['Team'] == current_team) & (~df['POS'].str.contains('P'))].index.tolist()
-                if len(h_idx) >= int(min_stack): prob += pulp.lpSum([x[p][s] for p in h_idx for s in slots]) >= int(min_stack)
-                else: continue
+                if len(h_idx) >= int(min_stack):
+                    prob += pulp.lpSum([x[p][s] for p in h_idx for s in slots]) >= int(min_stack)
+                else:
+                    continue
                 prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=1))
                 if pulp.LpStatus[prob.status] in ['Optimal', 'Feasible'] and pulp.value(prob.objective) > highest_score:
                     highest_score = pulp.value(prob.objective)
@@ -163,16 +197,26 @@ def run_optimizer(df_input, num_lineups=1, locks=[], stack_team=None, min_stack=
                         for s in slots:
                             if x[p][s].varValue == 1:
                                 row = df.loc[p]
-                                l_players.append({'Slot': s, 'Name': row['Player'], 'Team': row['Team'], 'Logo': get_logo_url(row['Team']), 'Proj': round(row['Solver_Proj'], 2), 'Salary': row['Salary'], 'SortKey': POS_ORDER[s]})
-                                p_idx.append(p); t_sal += row['Salary']; t_proj += row['Solver_Proj']
+                                l_players.append({'Slot': s, 'Name': row['Player'], 'Team': row['Team'],
+                                                  'Logo': get_logo_url(row['Team']),
+                                                  'Proj': round(row['Solver_Proj'], 2), 'Salary': row['Salary'],
+                                                  'SortKey': POS_ORDER[s]})
+                                p_idx.append(p);
+                                t_sal += row['Salary'];
+                                t_proj += row['Solver_Proj']
                     l_players.sort(key=lambda x: x['SortKey'])
-                    best_lineup = {'players': l_players, 'total_salary': t_sal, 'total_projection': round(t_proj, 2), 'indices': p_idx}
-            except: continue
+                    best_lineup = {'players': l_players, 'total_salary': t_sal, 'total_projection': round(t_proj, 2),
+                                   'indices': p_idx}
+            except:
+                continue
         if best_lineup:
-            all_results.append(best_lineup); used_player_indices.append(best_lineup['indices'])
+            all_results.append(best_lineup);
+            used_player_indices.append(best_lineup['indices'])
             for idx in best_lineup['indices']: player_usage[idx] += 1
-        else: break
+        else:
+            break
     return all_results
+
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
@@ -181,11 +225,13 @@ def index():
     df_raw = pd.read_csv(SALARY_CSV)
     confirmed_teams = set()
     order_col = next((c for c in df_raw.columns if 'order' in c.lower()), None)
-    if order_col: confirmed_teams = set(df_raw[pd.to_numeric(df_raw[order_col], errors='coerce').between(1, 9)]['Team'].unique())
+    if order_col: confirmed_teams = set(
+        df_raw[pd.to_numeric(df_raw[order_col], errors='coerce').between(1, 9)]['Team'].unique())
 
     df_raw['norm_name'] = df_raw['Player'].apply(normalize_name)
     df_raw['CleanHand'] = df_raw['Hand'].apply(clean_hand_str)
-    df_raw['Salary'] = pd.to_numeric(df_raw['Salary'].astype(str).replace(r'[\$,]', '', regex=True).apply(lambda x: float(x.replace('k', '')) * 1000 if 'k' in str(x).lower() else x), errors='coerce').fillna(0)
+    df_raw['Salary'] = pd.to_numeric(df_raw['Salary'].astype(str).replace(r'[\$,]', '', regex=True).apply(
+        lambda x: float(x.replace('k', '')) * 1000 if 'k' in str(x).lower() else x), errors='coerce').fillna(0)
     df_raw['Proj'] = pd.to_numeric(df_raw['Projected Points'], errors='coerce').fillna(0)
     if not h_fg.empty: df_raw = df_raw.merge(h_fg, on='norm_name', how='left').fillna(0)
     if not p_fg.empty: df_raw = df_raw.merge(p_fg, on='norm_name', how='left').fillna(0)
@@ -197,9 +243,12 @@ def index():
         p_data['Logo'] = get_logo_url(r['Team'])
         o_h = p_hand_map.get(r['Opponent'], '?')
         p_data['OppP'] = "—" if 'P' in str(r['POS']) else o_h
-        p_data['Adv'] = False if 'P' in str(r['POS']) else (r['CleanHand'] == 'S' or (r['CleanHand'] == 'L' and o_h == 'R') or (r['CleanHand'] == 'R' and o_h == 'L'))
+        p_data['Adv'] = False if 'P' in str(r['POS']) else (
+                    r['CleanHand'] == 'S' or (r['CleanHand'] == 'L' and o_h == 'R') or (
+                        r['CleanHand'] == 'R' and o_h == 'L'))
         pool_list.append(p_data)
-        g_id = " vs ".join(sorted([TEAM_MAP.get(str(r['Team']), str(r['Team'])), TEAM_MAP.get(str(r['Opponent']), str(r['Opponent']))]))
+        g_id = " vs ".join(sorted(
+            [TEAM_MAP.get(str(r['Team']), str(r['Team'])), TEAM_MAP.get(str(r['Opponent']), str(r['Opponent']))]))
         if g_id not in unique_game_map: unique_game_map[g_id] = {'t1': r['Team'], 't2': r['Opponent']}
 
     available_games = []
@@ -208,16 +257,26 @@ def index():
         available_games.append({
             "id": g_id, "display": g_id, "time": time_data['display'], "sort_time": time_data['raw'],
             "t1": teams['t1'], "t2": teams['t2'], "l1": get_logo_url(teams['t1']), "l2": get_logo_url(teams['t2']),
-            "i1": '<span class="status-dot on"></span>' if teams['t1'] in confirmed_teams else '<span class="status-dot off"></span>',
-            "i2": '<span class="status-dot on"></span>' if teams['t2'] in confirmed_teams else '<span class="status-dot off"></span>'
+            "i1": '<span class="status-dot on"></span>' if teams[
+                                                               't1'] in confirmed_teams else '<span class="status-dot off"></span>',
+            "i2": '<span class="status-dot on"></span>' if teams[
+                                                               't2'] in confirmed_teams else '<span class="status-dot off"></span>'
         })
     available_games.sort(key=lambda x: x['sort_time'])
 
     results, status = None, "SYSTEMS LIVE"
     if request.method == 'POST':
-        results = run_optimizer(df_raw, num_lineups=int(request.form.get('num_lineups', 5)), locks=request.form.getlist('player_locks'), stack_team=request.form.get('stack_team'), min_stack=request.form.get('min_stack', 3), diversity=int(request.form.get('diversity', 4)), exposure_limit=float(request.form.get('exposure_limit', 1.0)), excluded_games=[g['id'] for g in available_games if g['id'] not in request.form.getlist('games')])
+        results = run_optimizer(df_raw, num_lineups=int(request.form.get('num_lineups', 5)),
+                                locks=request.form.getlist('player_locks'), stack_team=request.form.get('stack_team'),
+                                min_stack=request.form.get('min_stack', 3),
+                                diversity=int(request.form.get('diversity', 4)),
+                                exposure_limit=float(request.form.get('exposure_limit', 1.0)),
+                                excluded_games=[g['id'] for g in available_games if
+                                                g['id'] not in request.form.getlist('games')])
         status = f"LOCKED {len(results)} LINEUPS"
-    return render_template_string(HTML_BODY, results=results, status=status, teams=sorted(df_raw['Team'].dropna().unique()), games=available_games, pool=pool_list)
+    return render_template_string(HTML_BODY, results=results, status=status,
+                                  teams=sorted(df_raw['Team'].dropna().unique()), games=available_games, pool=pool_list)
+
 
 HTML_BODY = """
 <!DOCTYPE html>
@@ -318,16 +377,22 @@ HTML_BODY = """
                         <tbody id="pBody">
                             {% for p in pool %}
                             <tr>
-                                <td><input type="checkbox" name="player_locks" value="{{ p.Player }}" style="width:18px; height:18px;"></td>
-                                <td><img src="{{ p.Logo }}" class="team-logo-icon"><span class="player-name">{{ p.Player }}</span></td>
-                                <td style="color:var(--accent); font-weight:bold;">{{ p.POS }}</td>
-                                <td style="color:#8b949e">{{ p.Team }}</td>
-                                <td><span class="hand-tag {{ 'adv-match' if p.Adv else 'neut-match' }}">{{ p.Hand }}</span></td>
-                                <td class="stat-val" style="color:{{ 'var(--p-edge)' if 'P' in p.POS else 'var(--h-edge)' }}">{{ (p['K-BB%']*100)|round(0) if 'P' in p.POS else (p['Barrel%']*100)|round(0) }}%</td>
-                                <td class="stat-val">{{ p.SIERA|round(2) if 'P' in p.POS else p.xwOBA|round(3) }}</td>
-                                <td class="stat-val" style="color:var(--accent)">{{ p.Chalk_Quality|round(0) if 'P' in p.POS else p.Edge_Value|round(0) }}</td>
-                                <td class="stat-val" style="color:#f0f6fc">${{ "{:,.0f}".format(p.Salary) }}</td>
-                                <td class="stat-val" style="color:#f0f6fc; font-weight:700;">{{ p.Proj|round(1) }}</td>
+                                <td><input type="checkbox" name="player_locks" value="{{ p.get('Player','') }}" style="width:18px; height:18px;"></td>
+                                <td><img src="{{ p.get('Logo','') }}" class="team-logo-icon"><span class="player-name">{{ p.get('Player','') }}</span></td>
+                                <td style="color:var(--accent); font-weight:bold;">{{ p.get('POS','') }}</td>
+                                <td style="color:#8b949e">{{ p.get('Team','') }}</td>
+                                <td><span class="hand-tag {{ 'adv-match' if p.get('Adv') else 'neut-match' }}">{{ p.get('Hand','') }}</span></td>
+                                <td class="stat-val" style="color:{{ 'var(--p-edge)' if 'P' in p.get('POS','') else 'var(--h-edge)' }}">
+                                    {{ (p.get('K-BB%', 0)*100)|round(0) if 'P' in p.get('POS','') else (p.get('Barrel%', 0)*100)|round(0) }}%
+                                </td>
+                                <td class="stat-val">
+                                    {{ p.get('SIERA', 0)|round(2) if 'P' in p.get('POS','') else p.get('xwOBA', 0)|round(3) }}
+                                </td>
+                                <td class="stat-val" style="color:var(--accent)">
+                                    {{ p.get('Chalk_Quality', 0)|round(0) if 'P' in p.get('POS','') else p.get('Edge_Value', 0)|round(0) }}
+                                </td>
+                                <td class="stat-val" style="color:#f0f6fc">${{ "{:,.0f}".format(p.get('Salary',0)) }}</td>
+                                <td class="stat-val" style="color:#f0f6fc; font-weight:700;">{{ p.get('Proj',0)|round(1) }}</td>
                             </tr>
                             {% endfor %}
                         </tbody>
