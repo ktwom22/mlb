@@ -88,7 +88,6 @@ def get_weighted_stats():
         h26, h25 = batting_stats(2026), batting_stats(2025)
         h_merge = pd.merge(h26, h25, on='Name', how='outer', suffixes=('_26', '_25')).fillna(0)
 
-        # Ensure columns exist before weight calc
         for col in ['Barrel%_26', 'Barrel%_25', 'xwOBA_26', 'xwOBA_25']:
             if col not in h_merge.columns: h_merge[col] = 0
 
@@ -110,7 +109,6 @@ def get_weighted_stats():
         p26, p25 = pitching_stats(2026), pitching_stats(2025)
         p_merge = pd.merge(p26, p25, on='Name', how='outer', suffixes=('_26', '_25')).fillna(0)
 
-        # Ensure columns exist before weight calc
         for col in ['SIERA_26', 'SIERA_25', 'K-BB%_26', 'K-BB%_25']:
             if col not in p_merge.columns: p_merge[col] = 0
 
@@ -131,6 +129,11 @@ def get_weighted_stats():
 def run_optimizer(df_input, num_lineups=1, locks=[], stack_team=None, min_stack=3, diversity=4, excluded_games=[],
                   exposure_limit=1.0):
     df = df_input.copy()
+
+    # SAFETY: Ensure column exists before mapping
+    if 'Pitcher_Brl%' not in df.columns:
+        df['Pitcher_Brl%'] = 0.0
+
     all_results, used_player_indices = [], []
     player_usage = {p: 0 for p in df.index}
     max_count = max(1, int(num_lineups * exposure_limit))
@@ -223,6 +226,11 @@ def index():
     espn_times = get_espn_game_times()
     h_fg, p_fg = get_weighted_stats()
     df_raw = pd.read_csv(SALARY_CSV)
+
+    # Initialize empty columns to prevent KeyError if merge fails
+    for col in ['Pitcher_Brl%', 'Edge_Value', 'Chalk_Quality', 'SIERA', 'K-BB%', 'Barrel%', 'xwOBA']:
+        df_raw[col] = 0.0
+
     confirmed_teams = set()
     order_col = next((c for c in df_raw.columns if 'order' in c.lower()), None)
     if order_col: confirmed_teams = set(
@@ -233,8 +241,13 @@ def index():
     df_raw['Salary'] = pd.to_numeric(df_raw['Salary'].astype(str).replace(r'[\$,]', '', regex=True).apply(
         lambda x: float(x.replace('k', '')) * 1000 if 'k' in str(x).lower() else x), errors='coerce').fillna(0)
     df_raw['Proj'] = pd.to_numeric(df_raw['Projected Points'], errors='coerce').fillna(0)
-    if not h_fg.empty: df_raw = df_raw.merge(h_fg, on='norm_name', how='left').fillna(0)
-    if not p_fg.empty: df_raw = df_raw.merge(p_fg, on='norm_name', how='left').fillna(0)
+
+    if not h_fg.empty:
+        df_raw = df_raw.drop(columns=['Edge_Value', 'Barrel%', 'xwOBA']).merge(h_fg, on='norm_name', how='left').fillna(
+            0)
+    if not p_fg.empty:
+        df_raw = df_raw.drop(columns=['Chalk_Quality', 'SIERA', 'K-BB%', 'Pitcher_Brl%']).merge(p_fg, on='norm_name',
+                                                                                                how='left').fillna(0)
 
     p_hand_map = df_raw[df_raw['POS'].str.contains('P', na=False)].set_index('Team')['CleanHand'].to_dict()
     pool_list, unique_game_map = [], {}
@@ -437,5 +450,5 @@ HTML_BODY = """
 """
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
