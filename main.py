@@ -6,7 +6,7 @@ import random
 import time
 import os
 import statsapi
-from flask import Flask, render_template_string, request
+from flask import Flask, render_template_string, request, Response
 from datetime import datetime
 import pytz
 import requests
@@ -131,7 +131,6 @@ def get_weighted_stats():
     global _STATS_CACHE
     if _STATS_CACHE['h'] is not None and (time.time() - _STATS_CACHE['time']) < 3600:
         return _STATS_CACHE['h'], _STATS_CACHE['p']
-
     W25, W26 = 0.7, 0.3
     p25, p26 = fetch_pitcher_metrics(2025), fetch_pitcher_metrics(2026)
     blended_p = []
@@ -152,7 +151,6 @@ def get_weighted_stats():
             'Chalk_Quality': round(max(0.1, chalk), 2), 'WHIP': round(whip, 2),
             'K/9': round(k9, 2), 'HR/9': blend_p('HR9', 1.2), 'GS': s26['GS'] if s26 else (s25['GS'] if s25 else 0)
         })
-
     h25, h26 = fetch_hitter_metrics(2025), fetch_hitter_metrics(2026)
     blended_h = []
     all_h_names = set(h25.keys()) | set(h26.keys())
@@ -170,7 +168,6 @@ def get_weighted_stats():
             'norm_name': name, 'full_name': s26['full_name'] if s26 else s25['full_name'],
             'ISO': round(iso, 3), 'wRC+': int(blend_h('wRC_proxy', 100)), 'Edge_Value': round(iso * 400, 2)
         })
-
     h_df, p_df = pd.DataFrame(blended_h), pd.DataFrame(blended_p)
     _STATS_CACHE.update({'h': h_df, 'p': p_df, 'time': time.time()})
     return h_df, p_df
@@ -185,22 +182,18 @@ def run_optimizer(df_input, num_lineups=1, locks=[], stack_team=None, min_stack=
         df = df[~df.apply(lambda r: " vs ".join(sorted([TEAM_MAP.get(str(r['Team']), str(r['Team'])),
                                                         TEAM_MAP.get(str(r['Opponent']),
                                                                      str(r['Opponent']))])) in excluded_games, axis=1)]
-
     all_results, used_player_indices = [], []
     player_usage = {p: 0 for p in df.index}
     max_count = max(1, int(num_lineups * exposure_limit))
     p_hand_map = df[df['POS'].str.contains('P', na=False)].set_index('Team')['CleanHand'].to_dict()
 
     def apply_logic(row):
-        # Mechanical Priority: Check for "Kris Bubic projected points" specifically as requested
         proj_val = row.get('Kris Bubic projected points', row.get('Proj', 5.0))
         proj = float(proj_val) if float(proj_val) > 0 else 5.0
-
         t1, t2 = TEAM_MAP.get(str(row['Team']), str(row['Team'])), TEAM_MAP.get(str(row['Opponent']),
                                                                                 str(row['Opponent']))
         game_id = " vs ".join(sorted([t1, t2]))
         w = weather_data.get(game_id, {'temp': 70, 'wind': '0 mph, Calm', 'condition': 'Clear'})
-
         if 'P' in str(row['POS']):
             proj += (float(row.get('Chalk_Quality', 0)) * 0.8)
         else:
@@ -210,14 +203,9 @@ def run_optimizer(df_input, num_lineups=1, locks=[], stack_team=None, min_stack=
                 proj *= 1.25
             elif row['Order'] <= 5:
                 proj *= 1.15
-
-            if float(row.get('Edge_Value', 0)) > 0:
-                proj = (proj * 0.5) + (row['Edge_Value'] * 0.15)
-
+            if float(row.get('Edge_Value', 0)) > 0: proj = (proj * 0.5) + (row['Edge_Value'] * 0.15)
             b_h, o_h = row.get('CleanHand', '?'), p_hand_map.get(row['Opponent'], '?')
-            if b_h == 'S' or (b_h == 'L' and o_h == 'R') or (b_h == 'R' and o_h == 'L'):
-                proj *= 1.15
-
+            if b_h == 'S' or (b_h == 'L' and o_h == 'R') or (b_h == 'R' and o_h == 'L'): proj *= 1.15
             wind, cond = str(w['wind']).lower(), str(w['condition']).lower()
             if "dome" not in cond:
                 if isinstance(w['temp'], int) and w['temp'] >= 85: proj *= 1.10
@@ -225,7 +213,6 @@ def run_optimizer(df_input, num_lineups=1, locks=[], stack_team=None, min_stack=
                     proj *= 1.08
                 elif 'in' in wind:
                     proj *= 0.92
-
         return proj * random.uniform(0.97, 1.03)
 
     df['Solver_Proj'] = df.apply(apply_logic, axis=1)
@@ -237,43 +224,31 @@ def run_optimizer(df_input, num_lineups=1, locks=[], stack_team=None, min_stack=
         best_lineup = None
         highest_score = -1
         random.shuffle(teams_to_stack)
-
         for current_team in teams_to_stack[:3]:
             try:
                 prob = pulp.LpProblem(f"MLB_{i}_{current_team}", pulp.LpMaximize)
                 players = df.index.tolist()
                 slots = list(POS_ORDER.keys())
                 x = pulp.LpVariable.dicts("x", (players, slots), cat="Binary")
-
                 prob += pulp.lpSum([df.loc[p, 'Solver_Proj'] * x[p][s] for p in players for s in slots])
                 prob += pulp.lpSum([df.loc[p, 'Salary'] * x[p][s] for p in players for s in slots]) <= 50000
-
                 for s in slots: prob += pulp.lpSum([x[p][s] for p in players]) == 1
                 for p in players:
                     prob += pulp.lpSum([x[p][s] for s in slots]) <= 1
                     if df.loc[p, 'Player'] in locks: prob += pulp.lpSum([x[p][s] for s in slots]) == 1
                     if player_usage.get(p, 0) >= max_count: prob += pulp.lpSum([x[p][s] for s in slots]) == 0
-
                     pos = str(df.loc[p, 'POS'])
                     for s in slots:
-                        valid = any([
-                            (s.startswith('P') and 'P' in pos),
-                            (s == 'C' and 'C' in pos),
-                            (s == '1B' and '1B' in pos),
-                            (s == '2B' and '2B' in pos),
-                            (s == '3B' and '3B' in pos),
-                            (s == 'SS' and 'SS' in pos),
-                            (s.startswith('OF') and 'OF' in pos)
-                        ])
+                        valid = any(
+                            [(s.startswith('P') and 'P' in pos), (s == 'C' and 'C' in pos), (s == '1B' and '1B' in pos),
+                             (s == '2B' and '2B' in pos), (s == '3B' and '3B' in pos), (s == 'SS' and 'SS' in pos),
+                             (s.startswith('OF') and 'OF' in pos)])
                         if not valid: prob += x[p][s] == 0
-
-                for past in used_player_indices:
-                    prob += pulp.lpSum([x[p][s] for p in past for s in slots]) <= (len(slots) - diversity)
-
+                for past in used_player_indices: prob += pulp.lpSum([x[p][s] for p in past for s in slots]) <= (
+                            len(slots) - diversity)
                 h_idx = df[(df['Team'] == current_team) & (~df['POS'].str.contains('P'))].index.tolist()
-                if len(h_idx) >= int(min_stack):
-                    prob += pulp.lpSum([x[p][s] for p in h_idx for s in slots]) >= int(min_stack)
-
+                if len(h_idx) >= int(min_stack): prob += pulp.lpSum([x[p][s] for p in h_idx for s in slots]) >= int(
+                    min_stack)
                 prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=3))
                 if pulp.LpStatus[prob.status] == 'Optimal':
                     score = pulp.value(prob.objective)
@@ -296,7 +271,6 @@ def run_optimizer(df_input, num_lineups=1, locks=[], stack_team=None, min_stack=
                                        'total_projection': round(t_proj, 2), 'indices': p_indices}
             except:
                 continue
-
         if best_lineup:
             all_results.append(best_lineup)
             used_player_indices.append(best_lineup['indices'])
@@ -306,7 +280,27 @@ def run_optimizer(df_input, num_lineups=1, locks=[], stack_team=None, min_stack=
     return all_results
 
 
-# --- ROUTES ---
+# --- SEO & UTILITY ROUTES ---
+
+@app.route('/robots.txt')
+def robots():
+    lines = ["User-agent: *", "Disallow: /static/", "Allow: /", f"Sitemap: {request.url_root.rstrip('/')}/sitemap.xml"]
+    return Response("\n".join(lines), mimetype="text/plain")
+
+
+@app.route('/sitemap.xml')
+def sitemap():
+    pages = [[f"{request.url_root.rstrip('/')}/", "daily"]]
+    xml_sitemap = render_template_string('''<?xml version="1.0" encoding="UTF-8"?>
+        <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+            {% for page in pages %}
+            <url><loc>{{ page[0] }}</loc><changefreq>{{ page[1] }}</changefreq><priority>1.0</priority></url>
+            {% endfor %}
+        </urlset>''', pages=pages)
+    return Response(xml_sitemap, mimetype="application/xml")
+
+
+# --- MAIN ROUTES ---
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
@@ -314,18 +308,13 @@ def index():
     espn_times = get_espn_game_times()
     h_fg, p_fg = get_weighted_stats()
     df_raw = pd.read_csv(SALARY_CSV)
-
     sal_col = next((c for c in ['Salary', 'salary', 'Sal'] if c in df_raw.columns), 'Salary')
-    # Use specifically "Kris Bubic projected points" as the source if it exists
     proj_col = next((c for c in ['Kris Bubic projected points', 'Proj', 'FPTS', 'Points'] if c in df_raw.columns), None)
-
     df_raw['Salary'] = pd.to_numeric(df_raw[sal_col].astype(str).replace(r'[\$,]', '', regex=True),
                                      errors='coerce').fillna(0)
     df_raw['Proj_Base'] = pd.to_numeric(df_raw[proj_col], errors='coerce').fillna(0.0) if proj_col else 0.0
     df_raw['Order'] = pd.to_numeric(df_raw['Order'], errors='coerce').fillna(0) if 'Order' in df_raw.columns else 0
     df_raw['CleanHand'] = df_raw['Hand'].apply(clean_hand_str) if 'Hand' in df_raw.columns else '?'
-
-    # Fuzzy Merge Stats
     for col in ['Edge_Value', 'Chalk_Quality', 'ISO', 'wRC+', 'WHIP', 'HR/9', 'K/9', 'GS']: df_raw[col] = 0.0
     h_choices = h_fg['full_name'].tolist()
     for idx, row in df_raw[~df_raw['POS'].str.contains('P')].iterrows():
@@ -333,15 +322,12 @@ def index():
         if m and m[1] >= 75:
             s_row = h_fg[h_fg['full_name'] == m[0]].iloc[0]
             for c in ['Edge_Value', 'ISO', 'wRC+']: df_raw.at[idx, c] = s_row[c]
-
     p_choices = p_fg['full_name'].tolist()
     for idx, row in df_raw[df_raw['POS'].str.contains('P')].iterrows():
         m = process.extractOne(row['Player'], p_choices, scorer=fuzz.token_set_ratio)
         if m and m[1] >= 75:
             s_row = p_fg[p_fg['full_name'] == m[0]].iloc[0]
             for c in ['Chalk_Quality', 'WHIP', 'HR/9', 'K/9', 'GS']: df_raw.at[idx, c] = s_row[c]
-
-    # PRE-CALCULATE Projections for the Table View
     p_hand_map = df_raw[df_raw['POS'].str.contains('P')].set_index('Team')['CleanHand'].to_dict()
 
     def get_ui_proj(row):
@@ -354,7 +340,6 @@ def index():
         return round(base, 2)
 
     df_raw['Proj'] = df_raw.apply(get_ui_proj, axis=1)
-
     pool_list = []
     for _, r in df_raw.iterrows():
         p_data = r.to_dict()
@@ -364,7 +349,6 @@ def index():
         p_data.update({'Weather_Short': f"{w['temp']}°", 'Logo': get_logo_url(r['Team'])})
         p_data['Primary_Stat'] = f"WHP: {r['WHIP']:.2f}" if 'P' in str(r['POS']) else f"ISO: {r['ISO']:.3f}"
         p_data['Secondary_Stat'] = f"K/9: {r['K/9']:.1f}" if 'P' in str(r['POS']) else f"wRC: {int(r['wRC+'])}"
-
         w_icon = "⚪"
         wind, cond = str(w['wind']).lower(), str(w['condition']).lower()
         if "dome" in cond or "closed" in cond:
@@ -375,10 +359,9 @@ def index():
             w_icon = "❄️"
         p_data['W_Icon'] = w_icon
         p_data['Adv'] = False if 'P' in str(r['POS']) else (
-                r['CleanHand'] == 'S' or (r['CleanHand'] == 'L' and p_hand_map.get(r['Opponent']) == 'R') or (
-                r['CleanHand'] == 'R' and p_hand_map.get(r['Opponent']) == 'L'))
+                    r['CleanHand'] == 'S' or (r['CleanHand'] == 'L' and p_hand_map.get(r['Opponent']) == 'R') or (
+                        r['CleanHand'] == 'R' and p_hand_map.get(r['Opponent']) == 'L'))
         pool_list.append(p_data)
-
     unique_games = {}
     confirmed = set(df_raw[df_raw['Order'] > 0]['Team'].unique())
     for _, r in df_raw.iterrows():
@@ -391,7 +374,6 @@ def index():
                                   't1': r['Team'], 't2': r['Opponent'], 'l1': get_logo_url(r['Team']),
                                   'l2': get_logo_url(r['Opponent']), 'i1': r['Team'] in confirmed,
                                   'i2': r['Opponent'] in confirmed, 'weather': f"{w['temp']}° {w['condition']}"}
-
     game_list = sorted(unique_games.values(), key=lambda x: x['sort'])
     results, status = None, "SYSTEMS LIVE"
     if request.method == 'POST':
@@ -404,7 +386,6 @@ def index():
                                 exposure_limit=float(request.form.get('exposure_limit', 1.0)), excluded_games=excluded,
                                 weather_data=weather_info)
         status = f"LOCKED {len(results)} LINEUPS"
-
     return render_template_string(HTML_BODY, results=results, status=status,
                                   teams=sorted(df_raw['Team'].dropna().unique()), games=game_list, pool=pool_list)
 
@@ -462,7 +443,25 @@ HTML_BODY = """
 <!DOCTYPE html>
 <html>
 <head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-V4NJH4K19B"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-V4NJH4K19B');
+    </script>
+
+    <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MLB DFS Optimizer | Betify Sports</title>
+    <meta name="description" content="Free MLB DFS Lineup Optimizer with real-time weather, stats, and salary data. Built for high-stakes DFS players.">
+    <link rel="canonical" href="https://betifysports.com/" />
+
+    <meta property="og:title" content="Betify Pro MLB Optimizer">
+    <meta property="og:description" content="Generate winning MLB lineups with advanced stat blending and weather logic.">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://betifysports.com">
+
     <style>
         :root { --bg: #0d1117; --card: #161b22; --border: #30363d; --accent: #3fb950; --text: #c9d1d9; --header: #161b22; --win: #238636; --row-alt: #1c2128; --logo-bg: rgba(255, 255, 255, 0.12); }
         body { background: var(--bg); color: var(--text); font-family: -apple-system, system-ui, sans-serif; padding: 10px; margin: 0; }
@@ -524,10 +523,7 @@ HTML_BODY = """
                             <td style="color:var(--accent); font-weight:bold;">{{ p.POS }}</td>
                             <td>{{ p.Order if p.Order > 0 else '—' }}</td>
                             <td>{{ p.Team }}</td>
-                            <td style="text-align:center;">
-                                <div style="font-size: 1.2em;">{{ p.W_Icon }}</div>
-                                <div style="font-weight: bold;">{{ p.Weather_Short }}</div>
-                            </td>
+                            <td style="text-align:center;"><div style="font-size: 1.2em;">{{ p.W_Icon }}</div><div style="font-weight: bold;">{{ p.Weather_Short }}</div></td>
                             <td>{{ p.Primary_Stat }}<br>{{ p.Secondary_Stat }}</td>
                             <td><span class="hand-tag {{ 'adv-match' if p.Adv else 'neut-match' }}">{{ p.Hand }}</span></td>
                             <td class="stat-val" style="color:var(--accent)">{{ p.Chalk_Quality if 'P' in p.POS else p.Edge_Value }}</td>
