@@ -1,9 +1,9 @@
-Flask
+flask
 pandas
-pulp
 requests
+pulp
+thefuzz
+unidecode
+mlb-statsapi
 pytz
 gunicorn
-pybaseball
-curl_cffi
-unidecode
